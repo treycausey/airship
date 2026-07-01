@@ -3,6 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["segno"]
 # ///
+# file-length: accept — single-file uv script by design.
 """airship — install a finished iOS .ipa onto your iPhone over the air via Tailscale.
 
 Usage:
