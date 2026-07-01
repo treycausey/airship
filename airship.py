@@ -6,8 +6,9 @@
 """airship — install a finished iOS .ipa onto your iPhone over the air via Tailscale.
 
 Usage:
-    ./airship.py <app.ipa>
-    uv run airship.py <app.ipa>
+    ./airship.py [app.ipa] [--stay]
+
+With no argument, serves the newest .ipa found under the current directory.
 
 No cable, no shared WiFi. Both the Mac and the iPhone must be on the same
 Tailscale tailnet, with HTTPS certs enabled. The .ipa must be ad-hoc/development
@@ -19,20 +20,31 @@ See docs/2026-06-24-airship-design.md for the full design.
 from __future__ import annotations
 
 import argparse
+import datetime
 import http.server
 import json
+import os
 import plistlib
+import re
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import zipfile
+from html import escape
 from pathlib import Path
 from urllib.parse import quote
 
 PREFERRED_PORT = 4190  # airship's allocated dev-server block
+IDLE_EXIT_GRACE = 45.0  # seconds of quiet after the IPA download before auto-exit
+SKIP_DIRS = {"node_modules"}  # pruned (with dotdirs) during no-arg .ipa discovery
+
+# Ownership marker: lets the next run positively identify this run's processes
+# (previous airship, or an orphaned serve child after a crash) without guessing.
+INSTANCE_FILE = Path(tempfile.gettempdir()) / "airship-instance.json"
 
 # Stable, URL-safe staged filenames (never the original IPA basename).
 IPA_NAME = "app.ipa"
@@ -48,6 +60,14 @@ CONTENT_TYPES = {
 
 class AirshipError(Exception):
     """User-facing error with a clear message (no stack trace shown)."""
+
+
+def warn(msg: str) -> None:
+    print(f"\033[33m⚠ {msg}\033[0m", file=sys.stderr)
+
+
+def ok(msg: str) -> None:
+    print(f"\n  \033[32m✓ {msg}\033[0m")
 
 
 # --------------------------------------------------------------------------- #
@@ -94,16 +114,10 @@ def read_ipa_metadata(ipa_path: Path) -> dict[str, str]:
     # Manifest bundle-version is the build number (CFBundleVersion); fall back to
     # the marketing version.
     version = (
-        info.get("CFBundleVersion")
-        or info.get("CFBundleShortVersionString")
-        or "0"
+        info.get("CFBundleVersion") or info.get("CFBundleShortVersionString") or "0"
     )
     app_stem = Path(app_dir).name.removesuffix(".app")
-    title = (
-        info.get("CFBundleDisplayName")
-        or info.get("CFBundleName")
-        or app_stem
-    )
+    title = info.get("CFBundleDisplayName") or info.get("CFBundleName") or app_stem
 
     return {
         "bundle_id": str(bundle_id),
@@ -131,8 +145,6 @@ def warn_on_signing(ipa_path: Path, profile_member: str) -> None:
     plist = _decode_cms_plist(raw)
     if plist is None:
         return
-
-    import datetime
 
     expiry = plist.get("ExpirationDate")
     if isinstance(expiry, datetime.datetime):
@@ -167,27 +179,46 @@ def _decode_cms_plist(raw: bytes) -> dict | None:
             check=True,
         )
         return plistlib.loads(out.stdout)
-    except (subprocess.CalledProcessError, FileNotFoundError, plistlib.InvalidFileException):
+    except (
+        subprocess.CalledProcessError,
+        FileNotFoundError,
+        plistlib.InvalidFileException,
+    ):
         return None
 
 
 def _iphone_udid() -> str | None:
     """Best-effort: read the connected iPhone's UDID via `iinfo`."""
     try:
-        out = subprocess.run(
-            ["iinfo"], capture_output=True, text=True, timeout=10
-        )
+        out = subprocess.run(["iinfo"], capture_output=True, text=True, timeout=10)
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return None
     # iinfo output format is unknown to us; scan for a 40-hex or 8-16 UUID-ish
     # token. Keep this purely advisory.
-    import re
-
     for pat in (r"\b[0-9a-fA-F]{40}\b", r"\b[0-9A-F]{8}-[0-9A-F]{16}\b"):
         m = re.search(pat, out.stdout)
         if m:
             return m.group(0)
     return None
+
+
+def find_newest_ipa(root: Path) -> Path:
+    """Newest .ipa under root, skipping dot-directories and node_modules."""
+    root = root.resolve()
+    if root in (Path.home(), Path(root.anchor)):
+        raise AirshipError(
+            f"Refusing to hunt for .ipa files under {root} — run from a project "
+            "directory or pass a path explicitly."
+        )
+    candidates: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [
+            d for d in dirnames if not d.startswith(".") and d not in SKIP_DIRS
+        ]
+        candidates += [Path(dirpath) / f for f in filenames if f.endswith(".ipa")]
+    if not candidates:
+        raise AirshipError(f"No .ipa found under {root} — pass a path explicitly.")
+    return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
 # --------------------------------------------------------------------------- #
@@ -208,8 +239,8 @@ def tailscale_base_url() -> str:
         )
     except subprocess.CalledProcessError as exc:
         raise AirshipError(
-            "`tailscale status` failed — is this node logged in?\n"
-            + exc.stderr.strip()
+            "`tailscale status` failed — is this node up and logged in? "
+            "(try `tailscale up`)\n" + exc.stderr.strip()
         ) from exc
 
     dns_name = json.loads(out.stdout).get("Self", {}).get("DNSName", "")
@@ -219,33 +250,15 @@ def tailscale_base_url() -> str:
     return f"https://{host}"
 
 
-def assert_serve_root_free() -> None:
-    """Refuse to clobber an existing Serve mapping on `/`."""
+def tailscale_self_ips() -> frozenset[str]:
+    """This node's own Tailscale IPs (v4 and v6)."""
     try:
         out = subprocess.run(
-            ["tailscale", "serve", "status", "--json"],
-            capture_output=True,
-            text=True,
-            check=True,
+            ["tailscale", "ip"], capture_output=True, text=True, check=True
         )
+        return frozenset(line.strip() for line in out.stdout.splitlines() if line.strip())
     except subprocess.CalledProcessError:
-        return  # no existing config / older CLI — nothing to clobber
-    text = out.stdout.strip()
-    if not text or text == "null":
-        return
-    try:
-        cfg = json.loads(text)
-    except json.JSONDecodeError:
-        return
-    web = cfg.get("Web") or {}
-    for host_cfg in web.values():
-        handlers = (host_cfg or {}).get("Handlers") or {}
-        if "/" in handlers:
-            raise AirshipError(
-                "Tailscale Serve already maps `/` to another service. Run "
-                "`tailscale serve status` and clear it before using airship "
-                "(airship will not overwrite your existing Serve config)."
-            )
+        return frozenset()
 
 
 def tailscale_ip() -> str:
@@ -256,6 +269,186 @@ def tailscale_ip() -> str:
         return out.stdout.strip().splitlines()[0]
     except (subprocess.CalledProcessError, IndexError):
         return "(unknown)"
+
+
+def serve_status() -> dict:
+    try:
+        out = subprocess.run(
+            ["tailscale", "serve", "status", "--json"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return json.loads(out.stdout) or {}
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        return {}
+
+
+def inspect_serve_root(cfg: dict) -> tuple[str, str] | None:
+    """Find an existing Serve handler on `/` of port 443 (the only port airship
+    uses) in a `serve status --json` dict.
+
+    Returns (scope, target): scope is "background" (persistent `--bg` config,
+    top-level Web key) or "foreground" (a live `tailscale serve` session under
+    the Foreground key); target is the proxy URL or the raw handler. None when
+    `/` is free.
+    """
+
+    def root_target(web: dict) -> str | None:
+        for host, host_cfg in (web or {}).items():
+            if not host.endswith(":443"):
+                continue  # mappings on other HTTPS ports never conflict with us
+            handler = ((host_cfg or {}).get("Handlers") or {}).get("/")
+            if handler:
+                return handler.get("Proxy") or json.dumps(handler)
+        return None
+
+    target = root_target(cfg.get("Web") or {})
+    if target:
+        return ("background", target)
+    for session in (cfg.get("Foreground") or {}).values():
+        target = root_target((session or {}).get("Web") or {})
+        if target:
+            return ("foreground", target)
+    return None
+
+
+def proxy_port(target: str) -> int | None:
+    m = re.fullmatch(r"https?://(?:127\.0\.0\.1|localhost):(\d+)/?", target)
+    return int(m.group(1)) if m else None
+
+
+def _pid_command(pid: int) -> str | None:
+    """Command line of a live process, or None if it is gone."""
+    out = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True
+    )
+    return out.stdout.strip() or None
+
+
+def _terminate_pid(pid: int) -> None:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+
+def _wait_until(predicate, timeout: float, interval: float = 0.5) -> bool:
+    deadline = time.monotonic() + timeout
+    while True:
+        if predicate():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
+
+
+def read_instance() -> dict:
+    try:
+        return json.loads(INSTANCE_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def write_instance(serve_pid: int) -> None:
+    INSTANCE_FILE.write_text(
+        json.dumps({"pid": os.getpid(), "serve_pid": serve_pid})
+    )
+
+
+def ensure_serve_root_free() -> None:
+    """Make `/` on :443 available before we serve.
+
+    airship's own leftovers are identified positively via the instance file
+    written on every run: a previous airship still running is SIGTERMed and
+    taken over; an orphaned `tailscale serve` child from a crashed run is
+    killed (its foreground session dies with it). Anything else holding `/`
+    belongs to someone else and is never touched — airship refuses with
+    instructions instead.
+    """
+    inst = read_instance()
+    pid, serve_pid = inst.get("pid"), inst.get("serve_pid")
+    if pid and "airship" in (_pid_command(pid) or ""):
+        warn(f"Previous airship still running (pid {pid}) — taking over.")
+        _terminate_pid(pid)
+        if not _wait_until(lambda: _pid_command(pid) is None, timeout=15):
+            raise AirshipError(
+                f"Previous airship (pid {pid}) did not exit within 15s — "
+                "kill it manually and rerun."
+            )
+    elif serve_pid and "tailscale" in (_pid_command(serve_pid) or ""):
+        warn(
+            f"Cleaning up orphaned `tailscale serve` (pid {serve_pid}) "
+            "left by a crashed airship."
+        )
+        _terminate_pid(serve_pid)
+        _wait_until(lambda: _pid_command(serve_pid) is None, timeout=10)
+    INSTANCE_FILE.unlink(missing_ok=True)
+
+    # Whatever still maps `/` is not ours. Give teardown a moment, then refuse.
+    if _wait_until(lambda: inspect_serve_root(serve_status()) is None, timeout=5):
+        return
+    scope, target = inspect_serve_root(serve_status())
+    raise AirshipError(
+        f"Tailscale Serve already maps `/` to {target} ({scope}). airship will "
+        "not overwrite another service — if that mapping is stale, clear it "
+        "with `tailscale serve --https=443 off`; otherwise stop the service "
+        "that owns it."
+    )
+
+
+def _drain(proc: subprocess.Popen) -> str:
+    return (proc.stdout.read() if proc.stdout else "").strip()
+
+
+def start_serve(port: int) -> subprocess.Popen:
+    """Run foreground `tailscale serve <port>` and wait until `/` actually maps
+    to our port (or fail with the serve CLI's own output)."""
+    proc = subprocess.Popen(
+        ["tailscale", "serve", str(port)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                raise AirshipError(
+                    f"`tailscale serve {port}` exited immediately:\n{_drain(proc)}"
+                )
+            found = inspect_serve_root(serve_status())
+            if found and proxy_port(found[1]) == port:
+                return proc
+            time.sleep(0.5)
+        raise AirshipError("Timed out waiting for Tailscale Serve to map `/`.")
+    except BaseException:  # incl. Ctrl-C — never orphan the serve child
+        if proc.poll() is None:
+            proc.terminate()
+        raise
+
+
+def probe_landing(url: str) -> None:
+    """Confirm the HTTPS landing page answers before you walk to the phone.
+    Uses curl (always present on macOS, trusts system roots — uv-managed
+    Pythons may not have the system CA bundle)."""
+    try:
+        out = subprocess.run(
+            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+             "--max-time", "15", url],
+            capture_output=True, text=True, timeout=20,
+        )
+        code = out.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        code = ""
+    if code == "200":
+        print(f"  Reachability: \033[32m✓\033[0m {url} answers from this Mac.")
+    else:
+        warn(
+            f"Could not verify {url} from this Mac (HTTP {code or 'no response'}). "
+            "If the phone can't load it either, check HTTPS certs and "
+            "`tailscale serve status`."
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -269,10 +462,7 @@ def build_manifest(base_url: str, meta: dict[str, str]) -> bytes:
         "items": [
             {
                 "assets": [
-                    {
-                        "kind": "software-package",
-                        "url": f"{base_url}/{IPA_NAME}",
-                    }
+                    {"kind": "software-package", "url": f"{base_url}/{IPA_NAME}"}
                 ],
                 "metadata": {
                     "bundle-identifier": meta["bundle_id"],
@@ -288,17 +478,14 @@ def build_manifest(base_url: str, meta: dict[str, str]) -> bytes:
 
 def itms_url(base_url: str) -> str:
     manifest_url = f"{base_url}/{MANIFEST_NAME}"
-    return (
-        "itms-services://?action=download-manifest&url="
-        + quote(manifest_url, safe="")
+    return "itms-services://?action=download-manifest&url=" + quote(
+        manifest_url, safe=""
     )
 
 
 def build_index_html(base_url: str, meta: dict[str, str]) -> str:
     """Landing page. `&` in the href is HTML-escaped as `&amp;`."""
     href = itms_url(base_url).replace("&", "&amp;")
-    from html import escape
-
     title = escape(meta["title"])
     bundle_id = escape(meta["bundle_id"])
     version = escape(meta["version"])
@@ -335,7 +522,13 @@ def build_index_html(base_url: str, meta: dict[str, str]) -> str:
 
 def stage_artifacts(ipa_path: Path, base_url: str, meta: dict[str, str]) -> Path:
     staging = Path(tempfile.mkdtemp(prefix="airship-"))
-    shutil.copy2(ipa_path, staging / IPA_NAME)
+    # APFS clone: instant like a hardlink, but an immutable snapshot — a
+    # rebuild of the source .ipa cannot corrupt an in-flight download.
+    clone = subprocess.run(
+        ["cp", "-c", str(ipa_path), str(staging / IPA_NAME)], capture_output=True
+    )
+    if clone.returncode != 0:
+        shutil.copy2(ipa_path, staging / IPA_NAME)  # non-APFS fallback
     (staging / MANIFEST_NAME).write_bytes(build_manifest(base_url, meta))
     (staging / INDEX_NAME).write_text(build_index_html(base_url, meta))
     return staging
@@ -346,10 +539,73 @@ def stage_artifacts(ipa_path: Path, base_url: str, meta: dict[str, str]) -> Path
 # --------------------------------------------------------------------------- #
 
 
-def make_handler(root: Path) -> type[http.server.SimpleHTTPRequestHandler]:
+class ServerState:
+    """Shared between HTTP handler threads and the main wait loop."""
+
+    def __init__(self, self_ips: frozenset[str] = frozenset()) -> None:
+        self.self_ips = self_ips  # this node's IPs, to ignore local test fetches
+        self.lock = threading.Lock()
+        self.in_flight = 0
+        self.last_request = time.monotonic()
+        self.ipa_downloaded_at: float | None = None
+
+    def note_request(self) -> None:
+        self.last_request = time.monotonic()
+
+    def note_ipa_downloaded(self) -> None:
+        first = self.ipa_downloaded_at is None
+        self.ipa_downloaded_at = time.monotonic()
+        if first:
+            ok(
+                "IPA downloaded — the install is now running on the phone. "
+                "Ctrl-C is safe from here."
+            )
+
+    def should_exit(self, now: float) -> bool:
+        if self.ipa_downloaded_at is None or self.in_flight > 0:
+            return False
+        # Idle is measured from whichever happened last: the download finishing
+        # (not starting) or any later request.
+        return now - max(self.last_request, self.ipa_downloaded_at) >= IDLE_EXIT_GRACE
+
+
+def make_handler(
+    root: Path, state: ServerState
+) -> type[http.server.SimpleHTTPRequestHandler]:
     class Handler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, directory=str(root), **kwargs)
+
+        def send_response(self, code, message=None):
+            self._status = code
+            super().send_response(code, message)
+
+        def do_GET(self):
+            with state.lock:
+                state.in_flight += 1
+            try:
+                super().do_GET()
+                # Reached only when the full body streamed without error.
+                if self._is_phone_ipa_download():
+                    state.note_ipa_downloaded()
+            finally:
+                with state.lock:
+                    state.in_flight -= 1
+
+        def _is_phone_ipa_download(self) -> bool:
+            """A 200, fully-streamed GET of the IPA from another tailnet device.
+            Tailscale Serve stamps X-Forwarded-For with the requester's tailnet
+            IP; local verification fetches carry this node's own IP (or none)."""
+            if self.path.split("?", 1)[0] != f"/{IPA_NAME}":
+                return False
+            if getattr(self, "_status", None) != 200:
+                return False  # 304 / 404 responses send no body
+            peer = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+            return bool(peer) and peer not in state.self_ips
+
+        def log_request(self, code="-", size="-"):
+            state.note_request()  # every handled request resets the idle clock
+            super().log_request(code, size)
 
         def guess_type(self, path):  # noqa: A003 (matching stdlib signature)
             for suffix, ctype in CONTENT_TYPES.items():
@@ -363,10 +619,12 @@ def make_handler(root: Path) -> type[http.server.SimpleHTTPRequestHandler]:
     return Handler
 
 
-def start_server(root: Path) -> tuple[http.server.ThreadingHTTPServer, int]:
+def start_server(
+    root: Path, state: ServerState
+) -> tuple[http.server.ThreadingHTTPServer, int]:
     """Bind 127.0.0.1 (Serve proxies from localhost; no LAN exposure needed).
     Prefer PREFERRED_PORT, fall back to an OS-assigned free port."""
-    handler = make_handler(root)
+    handler = make_handler(root, state)
     for port in (PREFERRED_PORT, 0):
         try:
             server = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
@@ -376,8 +634,7 @@ def start_server(root: Path) -> tuple[http.server.ThreadingHTTPServer, int]:
                 raise
             continue
     actual_port = server.server_address[1]
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    threading.Thread(target=server.serve_forever, daemon=True).start()
     return server, actual_port
 
 
@@ -386,47 +643,66 @@ def start_server(root: Path) -> tuple[http.server.ThreadingHTTPServer, int]:
 # --------------------------------------------------------------------------- #
 
 
-def warn(msg: str) -> None:
-    print(f"\033[33m⚠ {msg}\033[0m", file=sys.stderr)
-
-
-def run(ipa_path: Path) -> int:
+def run(ipa_path: Path, stay: bool = False) -> int:
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # so cleanup runs
     meta = read_ipa_metadata(ipa_path)
     warn_on_signing(ipa_path, meta["embedded_profile"])
 
     base_url = tailscale_base_url()
-    assert_serve_root_free()
+    ensure_serve_root_free()
 
-    staging = stage_artifacts(ipa_path, base_url, meta)
-    server, port = start_server(staging)
-
-    serve_proc = subprocess.Popen(["tailscale", "serve", str(port)])
-
-    def cleanup(*_args):
-        serve_proc.terminate()
-        try:
-            serve_proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            serve_proc.kill()
-        server.shutdown()
-        server.server_close()
-        shutil.rmtree(staging, ignore_errors=True)
-
-    signal.signal(signal.SIGINT, lambda *_: (cleanup(), sys.exit(0)))
-    signal.signal(signal.SIGTERM, lambda *_: (cleanup(), sys.exit(0)))
-
+    staging: Path | None = None
+    server: http.server.ThreadingHTTPServer | None = None
+    serve_proc: subprocess.Popen | None = None
     try:
-        landing = f"{base_url}/{INDEX_NAME}"
-        _print_handoff(meta, landing, base_url, port)
-        serve_proc.wait()  # block until Serve child exits
+        staging = stage_artifacts(ipa_path, base_url, meta)
+        state = ServerState(self_ips=tailscale_self_ips())
+        server, port = start_server(staging, state)
+        serve_proc = start_serve(port)
+        write_instance(serve_proc.pid)
+
+        _print_handoff(meta, base_url, port)
+        probe_landing(f"{base_url}/")
+        if stay:
+            print("\n  Serving — press Ctrl-C when the install finishes.")
+        else:
+            print(
+                "\n  Serving — exits by itself once the phone has downloaded "
+                f"the app and {int(IDLE_EXIT_GRACE)}s pass (or press Ctrl-C)."
+            )
+
+        while True:
+            time.sleep(0.5)
+            if serve_proc.poll() is not None:
+                raise AirshipError(
+                    f"tailscale serve exited unexpectedly.\n{_drain(serve_proc)}"
+                )
+            if not stay and state.should_exit(time.monotonic()):
+                ok("Done — cleaning up. Rerun airship if you need the link again.")
+                break
+    except KeyboardInterrupt:
+        print("\n  Stopping.")
     finally:
-        cleanup()
+        signal.signal(signal.SIGINT, signal.SIG_IGN)  # don't let ^C abort cleanup
+        if serve_proc is not None and serve_proc.poll() is None:
+            serve_proc.terminate()
+            try:
+                serve_proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                serve_proc.kill()
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
+        INSTANCE_FILE.unlink(missing_ok=True)
     return 0
 
 
-def _print_handoff(meta: dict[str, str], landing: str, base_url: str, port: int) -> None:
+def _print_handoff(meta: dict[str, str], base_url: str, port: int) -> None:
     import segno
 
+    landing = f"{base_url}/"
     print()
     print(f"  \033[1m{meta['title']}\033[0m  {meta['bundle_id']}  v{meta['version']}")
     print()
@@ -437,19 +713,35 @@ def _print_handoff(meta: dict[str, str], landing: str, base_url: str, port: int)
     print()
     print(f"  Tailscale IP: {tailscale_ip()}  (local server on 127.0.0.1:{port})")
     print(f"  itms link (debug): {itms_url(base_url)}")
-    print()
-    print("  Serving… press Ctrl-C when the install finishes.")
 
 
 def main(argv: list[str] | None = None) -> int:
+    sys.stdout.reconfigure(line_buffering=True)  # banner must show through pipes/tee
     parser = argparse.ArgumentParser(
         description="Install an iOS .ipa onto your iPhone over the air via Tailscale."
     )
-    parser.add_argument("ipa", type=Path, help="Path to the .ipa to install")
+    parser.add_argument(
+        "ipa",
+        nargs="?",
+        type=Path,
+        help="Path to the .ipa (default: newest .ipa under the current directory)",
+    )
+    parser.add_argument(
+        "--stay",
+        action="store_true",
+        help="Keep serving until Ctrl-C instead of auto-exiting after the install",
+    )
     args = parser.parse_args(argv)
 
     try:
-        return run(args.ipa)
+        ipa = args.ipa
+        if ipa is None:
+            ipa = find_newest_ipa(Path.cwd())
+            print(f"  Using newest .ipa: {ipa}")
+        return run(ipa, stay=args.stay)
+    except KeyboardInterrupt:
+        print("\n  Stopping.")
+        return 130
     except AirshipError as exc:
         print(f"\033[31m✗ {exc}\033[0m", file=sys.stderr)
         return 1

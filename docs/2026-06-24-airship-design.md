@@ -209,3 +209,40 @@ In `index.html` the href is written as
   the landing page and manifest with correct content types (curl over the
   tailnet), then install on the iPhone and confirm the app launches. Done is not
   claimed until the app is installed and opens on-device.
+
+## Addendum — 2026-07-01 hardening revision
+
+The following behaviors changed from the design above (the code is the source
+of truth; this addendum keeps the doc honest):
+
+- **CLI.** The `.ipa` argument is now optional: with no argument, airship
+  serves the newest `.ipa` under the current directory (dot-dirs and
+  `node_modules` pruned; refuses to search from `$HOME` or `/`). New `--stay`
+  flag keeps the old serve-until-Ctrl-C behavior.
+- **Landing page** moved from `/index.html` to `/` (shorter URL, smaller QR).
+- **Staging** uses an APFS clone (`cp -c`, falling back to `shutil.copy2`)
+  instead of a plain copy: instant like a hardlink, but an immutable snapshot,
+  so rebuilding the source `.ipa` mid-serve cannot corrupt an in-flight
+  download.
+- **Ownership marker.** Every run writes `$TMPDIR/airship-instance.json`
+  (airship pid + `tailscale serve` child pid). On startup, a previous airship
+  found alive via that file is SIGTERMed and taken over; an orphaned serve
+  child from a crashed run is killed (its foreground Serve session dies with
+  it). Ownership is proven by the instance file plus a `ps` command-line
+  check — never guessed from port probing. Step 4's rule is otherwise
+  unchanged: anything else mapping `/` on :443 is refused, never clobbered,
+  and mappings on other HTTPS ports are ignored entirely.
+- **Startup verification.** `tailscale serve` output is captured; airship
+  waits until the mapping actually appears in `serve status --json` (failing
+  with the CLI's own output if the child dies), then probes the HTTPS landing
+  URL via curl and reports reachability before handoff.
+- **Auto-exit.** After the phone — identified by Tailscale Serve's
+  `X-Forwarded-For` being another tailnet device (200-response, full body
+  streamed; local verification curls and 304s do not count) — finishes
+  downloading the IPA, airship exits on its own after 45 idle seconds and
+  cleans up. It never exits while a transfer is in flight. `--stay` disables
+  this. This kills the "forgotten airship blocks the next run" failure mode at
+  the source.
+- **Shutdown.** SIGINT is handled via KeyboardInterrupt (no double-cleanup
+  signal handlers); a second Ctrl-C during cleanup is ignored so teardown
+  always finishes; the instance file is removed on exit.

@@ -7,8 +7,12 @@ synthetic), with a placeholder app binary to keep it small.
 
 from __future__ import annotations
 
+import os
 import plistlib
+import shutil
 import sys
+import urllib.error
+import urllib.request
 import zipfile
 from pathlib import Path
 
@@ -160,7 +164,7 @@ def test_stage_artifacts_writes_url_safe_names():
 
 
 def test_handler_sets_correct_content_types(tmp_path):
-    handler_cls = airship.make_handler(tmp_path)
+    handler_cls = airship.make_handler(tmp_path, airship.ServerState())
     # guess_type is a method; check the suffix mapping it relies on
     assert airship.CONTENT_TYPES[".ipa"] == "application/octet-stream"
     assert airship.CONTENT_TYPES[".plist"] == "text/xml"
@@ -177,7 +181,7 @@ def test_server_falls_back_when_preferred_port_busy(monkeypatch):
     blocker.bind(("127.0.0.1", airship.PREFERRED_PORT))
     blocker.listen(1)
     try:
-        server, port = airship.start_server(Path("/tmp"))
+        server, port = airship.start_server(Path("/tmp"), airship.ServerState())
         try:
             assert port != airship.PREFERRED_PORT
             assert port > 0
@@ -186,3 +190,269 @@ def test_server_falls_back_when_preferred_port_busy(monkeypatch):
             server.shutdown()
     finally:
         blocker.close()
+
+
+# --------------------------------------------------------------------------- #
+# Staging: snapshot semantics (clone/copy, never a shared inode)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def staged():
+    meta = airship.read_ipa_metadata(FIXTURE)
+    staging = airship.stage_artifacts(FIXTURE, BASE_URL, meta)
+    yield staging
+    shutil.rmtree(staging, ignore_errors=True)
+
+
+def test_stage_snapshots_ipa_without_sharing_inode(staged):
+    # A rebuild of the source .ipa must not be able to corrupt what we serve:
+    # the staged copy is a clone/copy (own inode), not a hardlink.
+    src, dst = FIXTURE, staged / "app.ipa"
+    assert dst.read_bytes() == src.read_bytes()
+    assert dst.stat().st_ino != src.stat().st_ino
+
+
+# --------------------------------------------------------------------------- #
+# Serve-root inspection (Web + Foreground, scoped to :443)
+# --------------------------------------------------------------------------- #
+
+
+def test_inspect_serve_root_empty_config():
+    assert airship.inspect_serve_root({}) is None
+    assert airship.inspect_serve_root({"Web": {}}) is None
+
+
+def test_inspect_serve_root_finds_background_mapping():
+    cfg = {
+        "Web": {
+            "host.ts.net:443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:59999"}}}
+        }
+    }
+    assert airship.inspect_serve_root(cfg) == ("background", "http://127.0.0.1:59999")
+
+
+def test_inspect_serve_root_finds_foreground_session():
+    # Shape captured from `tailscale serve status --json` (v1.98.8) while a
+    # foreground `tailscale serve <port>` was running.
+    cfg = {
+        "Foreground": {
+            "212a6bcdde35ed99": {
+                "TCP": {"443": {"HTTPS": True}},
+                "Web": {
+                    "host.ts.net:443": {
+                        "Handlers": {"/": {"Proxy": "http://127.0.0.1:58888"}}
+                    }
+                },
+            }
+        }
+    }
+    assert airship.inspect_serve_root(cfg) == ("foreground", "http://127.0.0.1:58888")
+
+
+def test_inspect_serve_root_ignores_non_root_handlers():
+    cfg = {
+        "Web": {
+            "host.ts.net:443": {"Handlers": {"/other": {"Proxy": "http://127.0.0.1:1"}}}
+        }
+    }
+    assert airship.inspect_serve_root(cfg) is None
+
+
+def test_inspect_serve_root_ignores_non_443_ports():
+    # A mapping on another HTTPS port never conflicts with airship (which only
+    # serves on 443) and must not block or be touched.
+    cfg = {
+        "Web": {
+            "host.ts.net:8443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:3000"}}}
+        }
+    }
+    assert airship.inspect_serve_root(cfg) is None
+
+
+def test_proxy_port_parsing():
+    assert airship.proxy_port("http://127.0.0.1:4190") == 4190
+    assert airship.proxy_port("http://localhost:3000") == 3000
+    assert airship.proxy_port("/some/static/path") is None
+
+
+# --------------------------------------------------------------------------- #
+# Instance-file ownership and takeover / recovery branches
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def instance_file(monkeypatch, tmp_path):
+    path = tmp_path / "airship-instance.json"
+    monkeypatch.setattr(airship, "INSTANCE_FILE", path)
+    # Collapse the wait loops: evaluate the predicate once, no sleeping.
+    monkeypatch.setattr(
+        airship, "_wait_until", lambda pred, timeout, interval=0.5: pred()
+    )
+    return path
+
+
+def test_instance_file_round_trip(instance_file):
+    airship.write_instance(4243)
+    assert airship.read_instance() == {"pid": os.getpid(), "serve_pid": 4243}
+
+
+def test_ensure_root_free_when_nothing_running(instance_file, monkeypatch):
+    monkeypatch.setattr(airship, "serve_status", lambda: {})
+    airship.ensure_serve_root_free()  # must not raise
+
+
+def test_ensure_root_refuses_foreign_service(instance_file, monkeypatch):
+    cfg = {
+        "Web": {
+            "h.ts.net:443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:3000"}}}
+        }
+    }
+    monkeypatch.setattr(airship, "serve_status", lambda: cfg)
+    killed = []
+    monkeypatch.setattr(airship, "_terminate_pid", killed.append)
+    with pytest.raises(airship.AirshipError, match="not overwrite"):
+        airship.ensure_serve_root_free()
+    assert killed == []  # never touches processes it cannot prove are airship's
+
+
+def test_ensure_root_takes_over_previous_airship(instance_file, monkeypatch):
+    instance_file.write_text('{"pid": 4242, "serve_pid": 4243}')
+    alive = {4242: "python /Users/trey/dev/airship/airship.py app.ipa"}
+    monkeypatch.setattr(airship, "_pid_command", lambda pid: alive.get(pid))
+    killed = []
+    monkeypatch.setattr(
+        airship, "_terminate_pid", lambda pid: (killed.append(pid), alive.pop(pid, None))
+    )
+    monkeypatch.setattr(airship, "serve_status", lambda: {})
+    airship.ensure_serve_root_free()
+    assert killed == [4242]
+    assert not instance_file.exists()
+
+
+def test_ensure_root_kills_orphaned_serve_child(instance_file, monkeypatch):
+    instance_file.write_text('{"pid": 4242, "serve_pid": 4243}')
+    alive = {4243: "tailscale serve 4190"}  # airship pid gone, serve child orphaned
+    monkeypatch.setattr(airship, "_pid_command", lambda pid: alive.get(pid))
+    killed = []
+    monkeypatch.setattr(
+        airship, "_terminate_pid", lambda pid: (killed.append(pid), alive.pop(pid, None))
+    )
+    monkeypatch.setattr(airship, "serve_status", lambda: {})
+    airship.ensure_serve_root_free()
+    assert killed == [4243]
+    assert not instance_file.exists()
+
+
+def test_ensure_root_ignores_stale_instance_with_reused_pids(instance_file, monkeypatch):
+    instance_file.write_text('{"pid": 1, "serve_pid": 2}')
+    # Both pids now belong to unrelated processes.
+    monkeypatch.setattr(airship, "_pid_command", lambda pid: "/sbin/launchd")
+    killed = []
+    monkeypatch.setattr(airship, "_terminate_pid", killed.append)
+    monkeypatch.setattr(airship, "serve_status", lambda: {})
+    airship.ensure_serve_root_free()
+    assert killed == []
+    assert not instance_file.exists()
+
+
+# --------------------------------------------------------------------------- #
+# No-arg IPA discovery
+# --------------------------------------------------------------------------- #
+
+
+def test_find_newest_ipa_picks_most_recent(tmp_path):
+    old = tmp_path / "build" / "old.ipa"
+    new = tmp_path / "new.ipa"
+    old.parent.mkdir()
+    old.write_bytes(b"old")
+    new.write_bytes(b"new")
+    os.utime(old, (1_000_000, 1_000_000))
+    os.utime(new, (2_000_000, 2_000_000))
+    assert airship.find_newest_ipa(tmp_path) == new
+
+
+def test_find_newest_ipa_skips_hidden_and_node_modules(tmp_path):
+    hidden = tmp_path / ".git" / "x.ipa"
+    nm = tmp_path / "node_modules" / "y.ipa"
+    real = tmp_path / "app.ipa"
+    hidden.parent.mkdir()
+    nm.parent.mkdir()
+    hidden.write_bytes(b"h")
+    nm.write_bytes(b"n")
+    real.write_bytes(b"r")
+    os.utime(real, (1, 1))  # oldest, but the only eligible one
+    assert airship.find_newest_ipa(tmp_path) == real
+
+
+def test_find_newest_ipa_errors_when_none(tmp_path):
+    with pytest.raises(airship.AirshipError, match="No .ipa"):
+        airship.find_newest_ipa(tmp_path)
+
+
+# --------------------------------------------------------------------------- #
+# Download tracking, landing page at /, and idle auto-exit
+# --------------------------------------------------------------------------- #
+
+SELF_IP = "100.64.0.5"
+PHONE_IP = "100.64.0.7"
+
+
+def _get(port: int, path: str, **headers) -> bytes:
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers=headers)
+    with urllib.request.urlopen(req) as resp:
+        return resp.read()
+
+
+def test_server_marks_download_only_for_remote_full_fetch(staged):
+    state = airship.ServerState(self_ips=frozenset({SELF_IP}))
+    server, port = airship.start_server(staged, state)
+    try:
+        assert b"Install" in _get(port, "/")  # index.html served at /
+        # Local fetches (no X-Forwarded-For, or our own IP via the proxy) are
+        # verification traffic and must not arm the auto-exit timer.
+        _get(port, "/app.ipa")
+        _get(port, "/app.ipa", **{"X-Forwarded-For": SELF_IP})
+        assert state.ipa_downloaded_at is None
+        # A 304 conditional response sends no body and must not count.
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _get(
+                port,
+                "/app.ipa",
+                **{
+                    "X-Forwarded-For": PHONE_IP,
+                    "If-Modified-Since": "Fri, 01 Jan 2038 00:00:00 GMT",
+                },
+            )
+        assert exc.value.code == 304
+        assert state.ipa_downloaded_at is None
+        # A full 200 fetch from another tailnet device is the phone.
+        _get(port, "/app.ipa", **{"X-Forwarded-For": PHONE_IP})
+        assert state.ipa_downloaded_at is not None
+    finally:
+        server.shutdown()
+
+
+def test_should_exit_semantics():
+    state = airship.ServerState()
+    state.last_request = 100.0
+    assert state.should_exit(1e9) is False  # never downloaded → never auto-exit
+    # Idle is measured from download completion, even when the transfer took
+    # longer than the grace period (last_request stamps at request start).
+    state.ipa_downloaded_at = 200.0
+    assert state.should_exit(200.0 + airship.IDLE_EXIT_GRACE - 1) is False
+    assert state.should_exit(200.0 + airship.IDLE_EXIT_GRACE + 1) is True
+    # Never exit while a transfer is in flight, no matter how idle.
+    state.in_flight = 1
+    assert state.should_exit(1e9) is False
+    state.in_flight = 0
+    # A later request resets the idle clock.
+    state.last_request = 300.0
+    assert state.should_exit(300.0 + airship.IDLE_EXIT_GRACE - 1) is False
+
+
+def test_find_newest_ipa_refuses_home_and_root():
+    with pytest.raises(airship.AirshipError, match="project directory"):
+        airship.find_newest_ipa(Path.home())
+    with pytest.raises(airship.AirshipError, match="project directory"):
+        airship.find_newest_ipa(Path("/"))
