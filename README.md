@@ -34,7 +34,9 @@ does not build the app.
 ## Usage
 
 ```sh
-./airship.py path/to/YourApp.ipa
+./airship.py path/to/YourApp.ipa   # explicit path
+./airship.py                       # newest .ipa under the current directory
+./airship.py --stay                # keep serving until Ctrl-C (no auto-exit)
 ```
 
 You'll see something like:
@@ -43,17 +45,18 @@ You'll see something like:
   YourApp  com.you.yourapp  v1.4.2
 
   Open this on your iPhone (Safari), then tap Install:
-  https://your-mac.tailXXXXXX.ts.net/index.html
+  https://your-mac.tailXXXXXX.ts.net/
 
   [ QR code ]
 
   Tailscale IP: 100.x.y.z  (local server on 127.0.0.1:4190)
-  Serving… press Ctrl-C when the install finishes.
+  Serving — exits by itself once the phone has downloaded the app and 45s pass (or press Ctrl-C).
 ```
 
 On the iPhone: scan the QR (or open the URL) in **Safari**, tap **Install**, and
-confirm. When the app finishes installing, press **Ctrl-C** in the terminal to
-stop serving and clean up.
+confirm. Once the phone has downloaded the IPA, airship prints a confirmation
+and exits on its own after 45 quiet seconds — no need to come back to the
+terminal. Ctrl-C works anytime; `--stay` keeps it serving indefinitely.
 
 > Use Safari specifically — `itms-services://` install links do not work in
 > Chrome or other iOS browsers.
@@ -62,13 +65,24 @@ stop serving and clean up.
 
 1. Reads `CFBundleIdentifier` / `CFBundleVersion` / display name from the IPA's
    `Info.plist`.
-2. Stages the IPA, a `manifest.plist`, and a one-button `index.html` in a temp
-   dir under stable, URL-safe names.
+2. Stages the IPA (hardlinked, not copied), a `manifest.plist`, and a
+   one-button `index.html` in a temp dir under stable, URL-safe names.
 3. Serves them from `127.0.0.1` (an arbitrary free port, preferring 4190).
-4. Runs `tailscale serve <port>` so `https://<your-node>.ts.net/` proxies to it.
+4. Runs `tailscale serve <port>` so `https://<your-node>.ts.net/` proxies to
+   it, verifies the mapping actually appears in `tailscale serve status`, and
+   probes the HTTPS URL before telling you to pick up the phone.
 5. Prints the install URL and a QR code.
-6. On Ctrl-C, tears down only its own Serve mapping and removes the temp dir —
-   it never runs the node-wide `tailscale serve reset`.
+6. Watches the request log; once the phone has fetched the whole IPA and 45
+   quiet seconds pass, it exits and cleans up by itself (Ctrl-C also works).
+   It tears down only its own Serve mapping and temp dir — it never runs the
+   node-wide `tailscale serve reset`.
+
+If `/` on your node is already claimed, airship recovers on its own where it
+can prove ownership: every run writes an instance file (its pid and its
+`tailscale serve` child's pid), so a previous airship left running is killed
+and taken over, and an orphaned serve child from a crashed run is cleaned up.
+Anything airship cannot prove is its own — including stale-looking mappings —
+is never touched; it refuses and tells you the exact command to clear it.
 
 ## Troubleshooting
 
