@@ -37,6 +37,7 @@ does not build the app.
 ./airship.py path/to/YourApp.ipa   # explicit path
 ./airship.py                       # newest .ipa under the current directory
 ./airship.py --stay                # keep serving until Ctrl-C (no auto-exit)
+./airship.py --https-port 8445     # serve on a different HTTPS port (see below)
 ```
 
 You'll see something like:
@@ -60,6 +61,27 @@ terminal. Ctrl-C works anytime; `--stay` keeps it serving indefinitely.
 
 > Use Safari specifically — `itms-services://` install links do not work in
 > Chrome or other iOS browsers.
+
+### If the phone shows a different app at that URL
+
+443 is a **shared origin**. A PWA served from your Mac's bare `ts.net` address
+even once registers a service worker there, and that worker then controls the
+whole origin — it will serve its own cached shell in place of airship's install
+page, on a device where that app is not running and its dev server is not even
+up. curl the URL from the Mac to tell the two apart: if the Mac gets the install
+page and the phone does not, it is the phone's service worker, not airship.
+
+Fixes, cheapest first:
+
+- Open the URL in a **Private tab** — iOS Safari does not run service workers there.
+- `./airship.py --https-port 8445 …` — a different port is a different origin, so
+  a worker registered on 443 cannot intercept it. This is also the answer when
+  something legitimately owns `/` on 443 and you would rather not disturb it.
+- Fix the offending app to disown origins it does not serve.
+
+airship never overwrites another service's Serve mapping: it refuses with
+instructions instead. A mapping on any port *other* than the one it is using is
+not a conflict and is left alone.
 
 ## How it works
 
