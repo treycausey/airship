@@ -40,6 +40,13 @@ from pathlib import Path
 from urllib.parse import quote
 
 PREFERRED_PORT = 4190  # airship's allocated dev-server block
+# The HTTPS port Tailscale Serve publishes on. 443 is the tailnet default and
+# the right answer almost always — but it is a SHARED origin, and a service
+# worker registered there by any other project will serve its own cached shell
+# in place of the install page (this happened: a PWA on 443 swallowed the OTA
+# landing page). A different port is a different origin, which sidesteps that
+# entirely. See --https-port.
+DEFAULT_HTTPS_PORT = 443
 IDLE_EXIT_GRACE = 45.0  # seconds of quiet after the IPA download before auto-exit
 SKIP_DIRS = {"node_modules"}  # pruned (with dotdirs) during no-arg .ipa discovery
 
@@ -227,8 +234,9 @@ def find_newest_ipa(root: Path) -> Path:
 # --------------------------------------------------------------------------- #
 
 
-def tailscale_base_url() -> str:
-    """Return https://<node>.<tailnet>.ts.net with the trailing dot stripped."""
+def tailscale_base_url(https_port: int = DEFAULT_HTTPS_PORT) -> str:
+    """Return https://<node>.<tailnet>.ts.net for `https_port`, trailing dot
+    stripped. A non-443 port is appended, since that is a distinct origin."""
     if shutil.which("tailscale") is None:
         raise AirshipError("`tailscale` not found on PATH. Is Tailscale installed?")
     try:
@@ -248,6 +256,8 @@ def tailscale_base_url() -> str:
     host = dns_name.rstrip(".")  # FQDN comes back with a trailing dot
     if not host:
         raise AirshipError("Could not determine this node's Tailscale DNS name.")
+    if https_port != DEFAULT_HTTPS_PORT:
+        return f"https://{host}:{https_port}"
     return f"https://{host}"
 
 
@@ -285,9 +295,11 @@ def serve_status() -> dict:
         return {}
 
 
-def inspect_serve_root(cfg: dict) -> tuple[str, str] | None:
-    """Find an existing Serve handler on `/` of port 443 (the only port airship
-    uses) in a `serve status --json` dict.
+def inspect_serve_root(
+    cfg: dict, https_port: int = DEFAULT_HTTPS_PORT
+) -> tuple[str, str] | None:
+    """Find an existing Serve handler on `/` of `https_port` (the only port
+    airship will use) in a `serve status --json` dict.
 
     Returns (scope, target): scope is "background" (persistent `--bg` config,
     top-level Web key) or "foreground" (a live `tailscale serve` session under
@@ -295,9 +307,11 @@ def inspect_serve_root(cfg: dict) -> tuple[str, str] | None:
     `/` is free.
     """
 
+    suffix = f":{https_port}"
+
     def root_target(web: dict) -> str | None:
         for host, host_cfg in (web or {}).items():
-            if not host.endswith(":443"):
+            if not host.endswith(suffix):
                 continue  # mappings on other HTTPS ports never conflict with us
             handler = ((host_cfg or {}).get("Handlers") or {}).get("/")
             if handler:
@@ -357,8 +371,8 @@ def write_instance(serve_pid: int) -> None:
     )
 
 
-def ensure_serve_root_free() -> None:
-    """Make `/` on :443 available before we serve.
+def ensure_serve_root_free(https_port: int = DEFAULT_HTTPS_PORT) -> None:
+    """Make `/` on :`https_port` available before we serve.
 
     airship's own leftovers are identified positively via the instance file
     written on every run: a previous airship still running is SIGTERMed and
@@ -387,14 +401,17 @@ def ensure_serve_root_free() -> None:
     INSTANCE_FILE.unlink(missing_ok=True)
 
     # Whatever still maps `/` is not ours. Give teardown a moment, then refuse.
-    if _wait_until(lambda: inspect_serve_root(serve_status()) is None, timeout=5):
+    if _wait_until(
+        lambda: inspect_serve_root(serve_status(), https_port) is None, timeout=5
+    ):
         return
-    scope, target = inspect_serve_root(serve_status())
+    scope, target = inspect_serve_root(serve_status(), https_port)
     raise AirshipError(
-        f"Tailscale Serve already maps `/` to {target} ({scope}). airship will "
-        "not overwrite another service — if that mapping is stale, clear it "
-        "with `tailscale serve --https=443 off`; otherwise stop the service "
-        "that owns it."
+        f"Tailscale Serve already maps `/` on :{https_port} to {target} ({scope}). "
+        "airship will not overwrite another service — if that mapping is stale, "
+        f"clear it with `tailscale serve --https={https_port} off`; otherwise "
+        f"stop the service that owns it, or pick a free port with "
+        f"`--https-port <n>`."
     )
 
 
@@ -402,11 +419,15 @@ def _drain(proc: subprocess.Popen) -> str:
     return (proc.stdout.read() if proc.stdout else "").strip()
 
 
-def start_serve(port: int) -> subprocess.Popen:
-    """Run foreground `tailscale serve <port>` and wait until `/` actually maps
-    to our port (or fail with the serve CLI's own output)."""
+def start_serve(port: int, https_port: int = DEFAULT_HTTPS_PORT) -> subprocess.Popen:
+    """Run foreground `tailscale serve` and wait until `/` actually maps to our
+    port (or fail with the serve CLI's own output)."""
+    argv = ["tailscale", "serve"]
+    if https_port != DEFAULT_HTTPS_PORT:
+        argv.append(f"--https={https_port}")
+    argv.append(str(port))
     proc = subprocess.Popen(
-        ["tailscale", "serve", str(port)],
+        argv,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -416,9 +437,9 @@ def start_serve(port: int) -> subprocess.Popen:
         while time.monotonic() < deadline:
             if proc.poll() is not None:
                 raise AirshipError(
-                    f"`tailscale serve {port}` exited immediately:\n{_drain(proc)}"
+                    f"`{' '.join(argv)}` exited immediately:\n{_drain(proc)}"
                 )
-            found = inspect_serve_root(serve_status())
+            found = inspect_serve_root(serve_status(), https_port)
             if found and proxy_port(found[1]) == port:
                 return proc
             time.sleep(0.5)
@@ -644,13 +665,15 @@ def start_server(
 # --------------------------------------------------------------------------- #
 
 
-def run(ipa_path: Path, stay: bool = False) -> int:
+def run(
+    ipa_path: Path, stay: bool = False, https_port: int = DEFAULT_HTTPS_PORT
+) -> int:
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # so cleanup runs
     meta = read_ipa_metadata(ipa_path)
     warn_on_signing(ipa_path, meta["embedded_profile"])
 
-    base_url = tailscale_base_url()
-    ensure_serve_root_free()
+    base_url = tailscale_base_url(https_port)
+    ensure_serve_root_free(https_port)
 
     staging: Path | None = None
     server: http.server.ThreadingHTTPServer | None = None
@@ -659,7 +682,7 @@ def run(ipa_path: Path, stay: bool = False) -> int:
         staging = stage_artifacts(ipa_path, base_url, meta)
         state = ServerState(self_ips=tailscale_self_ips())
         server, port = start_server(staging, state)
-        serve_proc = start_serve(port)
+        serve_proc = start_serve(port, https_port)
         write_instance(serve_proc.pid)
 
         _print_handoff(meta, base_url, port)
@@ -732,6 +755,19 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Keep serving until Ctrl-C instead of auto-exiting after the install",
     )
+    parser.add_argument(
+        "--https-port",
+        type=int,
+        default=DEFAULT_HTTPS_PORT,
+        metavar="N",
+        help=(
+            f"Tailscale Serve HTTPS port (default {DEFAULT_HTTPS_PORT}). Use a "
+            "different port when something already owns `/` on the default, or "
+            "when a service worker from another project has claimed that origin "
+            "— a different port is a different origin, so it cannot intercept "
+            "the install page."
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -739,7 +775,7 @@ def main(argv: list[str] | None = None) -> int:
         if ipa is None:
             ipa = find_newest_ipa(Path.cwd())
             print(f"  Using newest .ipa: {ipa}")
-        return run(ipa, stay=args.stay)
+        return run(ipa, stay=args.stay, https_port=args.https_port)
     except KeyboardInterrupt:
         print("\n  Stopping.")
         return 130

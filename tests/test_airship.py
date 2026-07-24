@@ -259,9 +259,9 @@ def test_inspect_serve_root_ignores_non_root_handlers():
     assert airship.inspect_serve_root(cfg) is None
 
 
-def test_inspect_serve_root_ignores_non_443_ports():
-    # A mapping on another HTTPS port never conflicts with airship (which only
-    # serves on 443) and must not block or be touched.
+def test_inspect_serve_root_ignores_other_ports_by_default():
+    # A mapping on another HTTPS port never conflicts with airship on its
+    # default port, and must not block or be touched.
     cfg = {
         "Web": {
             "host.ts.net:8443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:3000"}}}
@@ -456,3 +456,95 @@ def test_find_newest_ipa_refuses_home_and_root():
         airship.find_newest_ipa(Path.home())
     with pytest.raises(airship.AirshipError, match="project directory"):
         airship.find_newest_ipa(Path("/"))
+
+
+# --- --https-port: a different port is a different origin ----------------- #
+
+
+def test_inspect_serve_root_matches_the_requested_port():
+    # The same config that is invisible on 443 IS the conflict on 8444.
+    cfg = {
+        "Web": {
+            "host.ts.net:8444": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:3000"}}}
+        }
+    }
+    assert airship.inspect_serve_root(cfg) is None
+    assert airship.inspect_serve_root(cfg, 8444) == (
+        "background",
+        "http://127.0.0.1:3000",
+    )
+
+
+def test_inspect_serve_root_foreground_honours_the_port():
+    cfg = {
+        "Foreground": {
+            "abc": {
+                "Web": {
+                    "host.ts.net:8444": {
+                        "Handlers": {"/": {"Proxy": "http://127.0.0.1:4190"}}
+                    }
+                }
+            }
+        }
+    }
+    assert airship.inspect_serve_root(cfg, 8444) == (
+        "foreground",
+        "http://127.0.0.1:4190",
+    )
+    assert airship.inspect_serve_root(cfg) is None
+
+
+def _fake_dns(monkeypatch):
+    import subprocess
+
+    class FakeRun:
+        stdout = '{"Self": {"DNSName": "example-mac.tail1234.ts.net."}}'
+
+    monkeypatch.setattr(airship.shutil, "which", lambda _: "/usr/local/bin/tailscale")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: FakeRun())
+
+
+def test_base_url_omits_the_default_port(monkeypatch):
+    _fake_dns(monkeypatch)
+    assert (
+        airship.tailscale_base_url()
+        == "https://example-mac.tail1234.ts.net"
+    )
+
+
+def test_base_url_appends_a_non_default_port(monkeypatch):
+    # The port has to reach the URL, or the manifest and landing page would
+    # advertise an origin nothing is listening on.
+    _fake_dns(monkeypatch)
+    assert (
+        airship.tailscale_base_url(8444)
+        == "https://example-mac.tail1234.ts.net:8444"
+    )
+
+
+def test_start_serve_passes_https_flag_only_when_non_default(monkeypatch):
+    calls: list[list[str]] = []
+
+    class FakeProc:
+        pid = 4321
+
+        def poll(self):
+            return None
+
+    def fake_popen(argv, **kwargs):
+        calls.append(argv)
+        return FakeProc()
+
+    monkeypatch.setattr(airship.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        airship,
+        "inspect_serve_root",
+        lambda cfg, port=443: ("foreground", "http://127.0.0.1:4190"),
+    )
+    monkeypatch.setattr(airship, "serve_status", lambda: {})
+
+    airship.start_serve(4190)
+    assert calls[-1] == ["tailscale", "serve", "4190"]
+
+    airship.start_serve(4190, 8444)
+    assert calls[-1] == ["tailscale", "serve", "--https=8444", "4190"]
