@@ -70,6 +70,13 @@ class AirshipError(Exception):
     """User-facing error with a clear message (no stack trace shown)."""
 
 
+def _printable(s: str) -> str:
+    """Strip control characters before echoing externally-sourced text (IPA
+    metadata, HTTP request lines) to the terminal — ANSI/OSC sequences could
+    otherwise rewrite what the user sees."""
+    return re.sub(r"[\x00-\x1f\x7f]", "�", s)
+
+
 def warn(msg: str) -> None:
     print(f"\033[33m⚠ {msg}\033[0m", file=sys.stderr)
 
@@ -113,8 +120,16 @@ def read_ipa_metadata(ipa_path: Path) -> dict[str, str]:
 
         info_name = info_candidates[0]
         app_dir = info_name[: -len("/Info.plist")]  # Payload/Foo.app
-        info = plistlib.loads(zf.read(info_name))
+        try:
+            info = plistlib.loads(zf.read(info_name))
+        except plistlib.InvalidFileException as exc:
+            raise AirshipError(f"Could not parse {info_name}: {exc}") from exc
 
+    if not isinstance(info, dict):
+        raise AirshipError(
+            f"{info_name} is a plist {type(info).__name__}, not the expected "
+            "dictionary — is this a real iOS app archive?"
+        )
     bundle_id = info.get("CFBundleIdentifier")
     if not bundle_id:
         raise AirshipError("Info.plist is missing CFBundleIdentifier.")
@@ -162,11 +177,16 @@ def warn_on_signing(ipa_path: Path, profile_member: str) -> None:
 
     devices = plist.get("ProvisionedDevices")
     if not devices:
-        warn(
-            "Provisioning profile has no ProvisionedDevices — this looks like an "
-            "App Store / enterprise profile and cannot install ad-hoc OTA on a "
-            "registered device."
-        )
+        # In-house/enterprise profiles provision every device — Apple supports
+        # OTA install for those, so only a device-less, non-enterprise profile
+        # (an App Store profile) is a problem.
+        if not plist.get("ProvisionsAllDevices"):
+            warn(
+                "Provisioning profile has no ProvisionedDevices and is not an "
+                "enterprise (ProvisionsAllDevices) profile — this looks like "
+                "an App Store profile and cannot install OTA on a registered "
+                "device."
+            )
         return
 
     known = _known_device_udids()
@@ -179,21 +199,26 @@ def warn_on_signing(ipa_path: Path, profile_member: str) -> None:
 
 
 def _decode_cms_plist(raw: bytes) -> dict | None:
-    """embedded.mobileprovision is a CMS-signed blob wrapping an XML plist."""
+    """embedded.mobileprovision is a CMS-signed blob wrapping an XML plist.
+    Returns None (callers skip, advisory-only) unless the blob decodes to the
+    expected dictionary."""
     try:
         out = subprocess.run(
             ["security", "cms", "-D", "-i", "/dev/stdin"],
             input=raw,
             capture_output=True,
             check=True,
+            timeout=10,
         )
-        return plistlib.loads(out.stdout)
+        plist = plistlib.loads(out.stdout)
     except (
         subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
         FileNotFoundError,
         plistlib.InvalidFileException,
     ):
         return None
+    return plist if isinstance(plist, dict) else None
 
 
 # Real iOS-family hardware carries a modern 8-16 UDID (00008120-000A11BB…)
@@ -240,12 +265,17 @@ def _known_device_udids() -> frozenset[str]:
                 capture_output=True, timeout=15, check=False,
             )
             # A parseable registry is authoritative, even when empty — don't
-            # ask xctrace's looser text output for a second opinion.
+            # ask xctrace's looser text output for a second opinion. But only
+            # a real registry counts: an error envelope (or any JSON without
+            # "result") must fall back, not read as "no devices".
             # TypeError/AttributeError: advisory code must survive any JSON
             # shape devicectl emits, not just the object we expect.
-            return parse_devicectl_udids(json.loads(out_path.read_text()))
+            data = json.loads(out_path.read_text())
+            if not isinstance(data, dict) or "result" not in data:
+                raise ValueError("no result envelope")
+            return parse_devicectl_udids(data)
         except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError,
-                TypeError, AttributeError):
+                ValueError, TypeError, AttributeError):
             pass  # devicectl unavailable or unusable — fall back to xctrace
     try:
         out = subprocess.run(
@@ -330,6 +360,9 @@ def tailscale_ip() -> str:
 
 
 def serve_status() -> dict:
+    """Parsed `tailscale serve status --json`. FAILS CLOSED: callers decide
+    whether `/` is safe to take based on this answer, so an unreadable status
+    raises instead of reading as "nothing is mapped"."""
     try:
         out = subprocess.run(
             ["tailscale", "serve", "status", "--json"],
@@ -338,8 +371,12 @@ def serve_status() -> dict:
             check=True,
         )
         return json.loads(out.stdout) or {}
-    except (subprocess.CalledProcessError, json.JSONDecodeError):
-        return {}
+    except (subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+        detail = exc.stderr.strip() if hasattr(exc, "stderr") and exc.stderr else exc
+        raise AirshipError(
+            "Could not read `tailscale serve status` — refusing to guess "
+            f"whether `/` is free.\n{detail}"
+        ) from exc
 
 
 def inspect_serve_root(
@@ -507,7 +544,12 @@ def start_serve(port: int, https_port: int = DEFAULT_HTTPS_PORT) -> ServeChild:
                 raise AirshipError(
                     f"`{' '.join(argv)}` exited immediately:\n{child.output()}"
                 )
-            found = inspect_serve_root(serve_status(), https_port)
+            try:
+                found = inspect_serve_root(serve_status(), https_port)
+            except AirshipError:
+                # Transient status failure mid-poll: keep polling — the
+                # deadline is the fail-closed backstop.
+                found = None
             if found and proxy_port(found[1]) == port:
                 return child
             time.sleep(0.5)
@@ -515,6 +557,11 @@ def start_serve(port: int, https_port: int = DEFAULT_HTTPS_PORT) -> ServeChild:
     except BaseException:  # incl. Ctrl-C — never orphan the serve child
         if child.proc.poll() is None:
             child.proc.terminate()
+            try:
+                child.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.proc.kill()
+        child.log.close()
         raise
 
 
@@ -706,7 +753,7 @@ def make_handler(
             return super().guess_type(path)
 
         def log_message(self, fmt, *args):
-            sys.stderr.write("  [http] " + (fmt % args) + "\n")
+            sys.stderr.write("  [http] " + _printable(fmt % args) + "\n")
 
     return Handler
 
@@ -784,6 +831,8 @@ def run(
                 serve.proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 serve.proc.kill()
+        if serve is not None:
+            serve.log.close()
         if server is not None:
             server.shutdown()
             server.server_close()
@@ -797,8 +846,11 @@ def _print_handoff(meta: dict[str, str], base_url: str, port: int) -> None:
     import segno
 
     landing = f"{base_url}/"
+    title, bundle_id, version = (
+        _printable(meta[k]) for k in ("title", "bundle_id", "version")
+    )
     print()
-    print(f"  \033[1m{meta['title']}\033[0m  {meta['bundle_id']}  v{meta['version']}")
+    print(f"  \033[1m{title}\033[0m  {bundle_id}  v{version}")
     print()
     print("  Open this on your iPhone (Safari), then tap Install:")
     print(f"  \033[36m{landing}\033[0m")
