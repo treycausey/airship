@@ -14,18 +14,24 @@ does not build the app.
 
 ## Prerequisites
 
-- **Tailscale** running on this Mac and on the iPhone, both on the same tailnet.
+- **Tailscale** running on this Mac and on the iPhone, both on the same
+  tailnet, with the `tailscale` CLI reachable on `PATH` (the macOS app ships
+  it — enable the CLI in the app's settings if `tailscale` is not found).
 - **HTTPS certs enabled** for your tailnet (Tailscale admin console → DNS →
   *Enable HTTPS*). Without this, Tailscale Serve cannot get a cert and install
   will fail.
 - **Tailscale ACLs** must allow the iPhone (your user) to reach this Mac on
-  port 443. The default "allow all" policy already does.
+  the HTTPS port airship uses — 443 by default, or whatever you pass with
+  `--https-port`. The default "allow all" policy already does.
 - The iPhone needs **internet access during install** — iOS contacts Apple to
   validate the app's signing certificate. Being on the tailnet alone is not
   enough.
 - The `.ipa` must be **ad-hoc or development signed** with the iPhone's UDID in
-  its provisioning profile. (App Store / enterprise builds cannot install this
-  way.) airship warns you before you walk to the phone if the embedded
+  its provisioning profile — or enterprise in-house signed with a
+  `ProvisionsAllDevices` profile, which Apple also supports for OTA install.
+  (App Store builds cannot install this way.) Development-signed apps
+  additionally need **Developer Mode** enabled on the iPhone.
+  airship warns you before you walk to the phone if the embedded
   provisioning profile is expired, has no provisioned devices, or lists none of
   the iPhones/iPads this Mac has paired with. (That last check reads Xcode's
   device registry via `xcrun devicectl` / `xcrun xctrace` when available and is
@@ -121,8 +127,9 @@ Funnel), and the local HTTP server binds `127.0.0.1` only.
 ## Troubleshooting
 
 - **"Unable to Install" on the phone** — almost always signing. The IPA must be
-  ad-hoc/development signed with this iPhone's UDID. Heed airship's signing
-  warnings.
+  ad-hoc/development signed with this iPhone's UDID (or enterprise in-house
+  signed). For development-signed apps, check Developer Mode is on (Settings →
+  Privacy & Security → Developer Mode). Heed airship's signing warnings.
 - **Connection refused / cert errors** — HTTPS certs aren't enabled for your
   tailnet, or the iPhone isn't on the tailnet. Check the Tailscale app on the
   phone.

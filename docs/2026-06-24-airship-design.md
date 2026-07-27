@@ -268,3 +268,10 @@ of truth; this addendum keeps the doc honest):
   never-drained pipe, so a chatty `tailscale serve` can never block on a
   full pipe buffer mid-serve.
 - MIT license added; example hostnames throughout the docs and tests.
+- **Corrections to the design above** (the code is the source of truth):
+  the CLI is `./airship.py`, not the `ship` alias sketched in step "Command";
+  startup verification probes the landing page `/` only, not all three
+  artifacts; `tailscale serve status` failures now fail closed (refuse to
+  proceed) rather than reading as "nothing mapped"; and profiles with
+  `ProvisionsAllDevices` (enterprise in-house) are recognized as OTA-capable
+  instead of being lumped in with App Store profiles.

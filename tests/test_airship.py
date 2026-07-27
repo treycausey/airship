@@ -70,6 +70,16 @@ def test_missing_bundle_id_raises(tmp_path):
         airship.read_ipa_metadata(bad)
 
 
+def test_non_dict_info_plist_raises_clear_error(tmp_path):
+    # A valid plist whose top level is an array must be a clean AirshipError,
+    # not an AttributeError traceback.
+    bad = tmp_path / "array.ipa"
+    with zipfile.ZipFile(bad, "w") as zf:
+        zf.writestr("Payload/Foo.app/Info.plist", plistlib.dumps(["not", "a", "dict"]))
+    with pytest.raises(airship.AirshipError, match="dictionary"):
+        airship.read_ipa_metadata(bad)
+
+
 def test_version_falls_back_to_short_version(tmp_path):
     ipa = tmp_path / "v.ipa"
     info = {"CFBundleIdentifier": "a.b.c", "CFBundleShortVersionString": "9.9"}
@@ -321,7 +331,7 @@ def test_ensure_root_refuses_foreign_service(instance_file, monkeypatch):
 
 def test_ensure_root_takes_over_previous_airship(instance_file, monkeypatch):
     instance_file.write_text('{"pid": 4242, "serve_pid": 4243}')
-    alive = {4242: "python /Users/trey/dev/airship/airship.py app.ipa"}
+    alive = {4242: "python /Users/me/dev/airship/airship.py app.ipa"}
     monkeypatch.setattr(airship, "_pid_command", lambda pid: alive.get(pid))
     killed = []
     monkeypatch.setattr(
@@ -591,6 +601,16 @@ def test_signing_quiet_when_a_known_device_is_provisioned(warnings, monkeypatch)
     assert warnings == []
 
 
+def test_signing_quiet_for_enterprise_profile(warnings, monkeypatch):
+    # ProvisionsAllDevices (enterprise in-house) profiles have no
+    # ProvisionedDevices yet Apple supports OTA install for them — no warning.
+    profile = _fixture_profile()
+    del profile["ProvisionedDevices"]
+    profile["ProvisionsAllDevices"] = True
+    _preflight(monkeypatch, profile, frozenset({KNOWN_IPHONE}))
+    assert warnings == []
+
+
 def test_signing_quiet_when_no_devices_are_known(warnings, monkeypatch):
     # No discoverable devices → the UDID check is skipped, not a false alarm.
     _preflight(monkeypatch, _fixture_profile(), frozenset())
@@ -710,6 +730,39 @@ def test_known_udids_falls_back_to_xctrace_when_devicectl_unusable(monkeypatch):
 
     monkeypatch.setattr(airship.subprocess, "run", fake_run)
     assert KNOWN_IPHONE in airship._known_device_udids()
+
+
+def test_known_udids_treats_error_envelope_as_unusable(monkeypatch):
+    # devicectl writing parseable JSON WITHOUT a result envelope (an error
+    # report) must fall back to xctrace, not read as "zero devices".
+    def fake_run(argv, **kwargs):
+        if "devicectl" in argv:
+            Path(argv[argv.index("--json-output") + 1]).write_text(
+                '{"error": {"code": 1}}'
+            )
+            return type("R", (), {"stdout": ""})()
+        return type("R", (), {"stdout": XCTRACE_OUTPUT})()
+
+    monkeypatch.setattr(airship.subprocess, "run", fake_run)
+    assert KNOWN_IPHONE in airship._known_device_udids()
+
+
+# --------------------------------------------------------------------------- #
+# serve_status fails closed
+# --------------------------------------------------------------------------- #
+
+
+def test_serve_status_raises_when_status_unreadable(monkeypatch):
+    # An unreadable status must never read as "nothing is mapped" — that is
+    # the answer that authorizes taking over `/`.
+    import subprocess
+
+    def fake_run(argv, **kwargs):
+        raise subprocess.CalledProcessError(1, argv, stderr="tailscaled hiccup")
+
+    monkeypatch.setattr(airship.subprocess, "run", fake_run)
+    with pytest.raises(airship.AirshipError, match="refusing to guess"):
+        airship.serve_status()
 
 
 def test_start_serve_passes_https_flag_only_when_non_default(monkeypatch):
