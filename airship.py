@@ -169,11 +169,12 @@ def warn_on_signing(ipa_path: Path, profile_member: str) -> None:
         )
         return
 
-    udid = _iphone_udid()
-    if udid and udid not in devices:
+    known = _known_device_udids()
+    if known and not known & set(devices):
         warn(
-            f"This iPhone's UDID ({udid}) is not in the provisioning profile's "
-            f"{len(devices)} provisioned device(s) — install will likely fail."
+            f"None of the {len(known)} device(s) this Mac knows about is in "
+            f"the provisioning profile's {len(devices)} provisioned "
+            "device(s) — install will likely fail."
         )
 
 
@@ -195,19 +196,65 @@ def _decode_cms_plist(raw: bytes) -> dict | None:
         return None
 
 
-def _iphone_udid() -> str | None:
-    """Best-effort: read the connected iPhone's UDID via `iinfo`."""
+# Real iOS-family hardware carries a modern 8-16 UDID (00008120-000A11BB…)
+# or a legacy 40-hex one; Macs and simulators carry standard 5-group UUIDs,
+# which neither pattern matches.
+_UDID_PATTERNS = (r"\b[0-9A-F]{8}-[0-9A-F]{16}\b", r"\b[0-9a-fA-F]{40}\b")
+
+
+def parse_devicectl_udids(data: dict) -> frozenset[str]:
+    """iOS-platform device UDIDs from `devicectl list devices` JSON."""
+    udids: set[str] = set()
+    for dev in (data.get("result") or {}).get("devices") or []:
+        hw = (dev or {}).get("hardwareProperties") or {}
+        if hw.get("platform") == "iOS" and hw.get("udid"):
+            udids.add(str(hw["udid"]))
+    return frozenset(udids)
+
+
+def parse_xctrace_udids(text: str) -> frozenset[str]:
+    """Device UDIDs from `xctrace list devices` text output (everything above
+    the simulators section; the UDID patterns skip Macs and simulators).
+    Unlike devicectl's JSON, the text carries no platform field, so non-iOS
+    hardware (an Apple TV, a Watch) is included — acceptable looseness for an
+    advisory fallback that only runs when devicectl is unusable."""
+    head = text.split("== Simulators ==", 1)[0]
+    found: set[str] = set()
+    for pat in _UDID_PATTERNS:
+        found.update(re.findall(pat, head))
+    return frozenset(found)
+
+
+def _known_device_udids() -> frozenset[str]:
+    """UDIDs of iPhones/iPads this Mac has paired with, even if currently
+    offline — the airship scenario is exactly a phone that is NOT cabled.
+    Best-effort and purely advisory: CoreDevice's registry via `devicectl`
+    (structured JSON, filterable to iOS), falling back to `xctrace` text.
+    Empty when Xcode tooling is unavailable."""
+    with tempfile.TemporaryDirectory() as td:
+        out_path = Path(td) / "devices.json"
+        try:
+            subprocess.run(
+                ["xcrun", "devicectl", "list", "devices", "--timeout", "5",
+                 "--json-output", str(out_path), "--quiet"],
+                capture_output=True, timeout=15, check=False,
+            )
+            # A parseable registry is authoritative, even when empty — don't
+            # ask xctrace's looser text output for a second opinion.
+            # TypeError/AttributeError: advisory code must survive any JSON
+            # shape devicectl emits, not just the object we expect.
+            return parse_devicectl_udids(json.loads(out_path.read_text()))
+        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError,
+                TypeError, AttributeError):
+            pass  # devicectl unavailable or unusable — fall back to xctrace
     try:
-        out = subprocess.run(["iinfo"], capture_output=True, text=True, timeout=10)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None
-    # iinfo output format is unknown to us; scan for a 40-hex or 8-16 UUID-ish
-    # token. Keep this purely advisory.
-    for pat in (r"\b[0-9a-fA-F]{40}\b", r"\b[0-9A-F]{8}-[0-9A-F]{16}\b"):
-        m = re.search(pat, out.stdout)
-        if m:
-            return m.group(0)
-    return None
+        out = subprocess.run(
+            ["xcrun", "xctrace", "list", "devices"],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return frozenset()
+    return parse_xctrace_udids(out.stdout)
 
 
 def find_newest_ipa(root: Path) -> Path:
@@ -336,7 +383,10 @@ def proxy_port(target: str) -> int | None:
 def _pid_command(pid: int) -> str | None:
     """Command line of a live process, or None if it is gone."""
     out = subprocess.run(
-        ["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True
+        ["ps", "-p", str(pid), "-o", "command="],
+        capture_output=True,
+        text=True,
+        check=False,  # nonzero simply means the pid is gone
     )
     return out.stdout.strip() or None
 
@@ -405,7 +455,10 @@ def ensure_serve_root_free(https_port: int = DEFAULT_HTTPS_PORT) -> None:
         lambda: inspect_serve_root(serve_status(), https_port) is None, timeout=5
     ):
         return
-    scope, target = inspect_serve_root(serve_status(), https_port)
+    found = inspect_serve_root(serve_status(), https_port)
+    if found is None:
+        return  # the conflict freed itself between the last poll and now
+    scope, target = found
     raise AirshipError(
         f"Tailscale Serve already maps `/` on :{https_port} to {target} ({scope}). "
         "airship will not overwrite another service — if that mapping is stale, "
@@ -415,38 +468,53 @@ def ensure_serve_root_free(https_port: int = DEFAULT_HTTPS_PORT) -> None:
     )
 
 
-def _drain(proc: subprocess.Popen) -> str:
-    return (proc.stdout.read() if proc.stdout else "").strip()
+class ServeChild:
+    """The foreground `tailscale serve` process plus its combined output.
+
+    Output goes to an unlinked temp file rather than a pipe: nothing reads
+    the child's output while airship serves (possibly for a long time), and
+    a chatty child on a full pipe buffer would block forever."""
+
+    def __init__(self, argv: list[str]) -> None:
+        # No context manager (SIM115): the log must outlive this scope — it
+        # lives as long as the child; the OS reclaims the unlinked file after.
+        # errors="replace": output() runs on failure paths, where a stray
+        # non-UTF-8 byte must not mask the real error with a decode crash.
+        self.log = tempfile.TemporaryFile(  # noqa: SIM115
+            mode="w+", encoding="utf-8", errors="replace"
+        )
+        self.proc = subprocess.Popen(
+            argv, stdout=self.log, stderr=subprocess.STDOUT
+        )
+
+    def output(self) -> str:
+        self.log.seek(0)
+        return self.log.read().strip()
 
 
-def start_serve(port: int, https_port: int = DEFAULT_HTTPS_PORT) -> subprocess.Popen:
+def start_serve(port: int, https_port: int = DEFAULT_HTTPS_PORT) -> ServeChild:
     """Run foreground `tailscale serve` and wait until `/` actually maps to our
     port (or fail with the serve CLI's own output)."""
     argv = ["tailscale", "serve"]
     if https_port != DEFAULT_HTTPS_PORT:
         argv.append(f"--https={https_port}")
     argv.append(str(port))
-    proc = subprocess.Popen(
-        argv,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+    child = ServeChild(argv)
     try:
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            if proc.poll() is not None:
+            if child.proc.poll() is not None:
                 raise AirshipError(
-                    f"`{' '.join(argv)}` exited immediately:\n{_drain(proc)}"
+                    f"`{' '.join(argv)}` exited immediately:\n{child.output()}"
                 )
             found = inspect_serve_root(serve_status(), https_port)
             if found and proxy_port(found[1]) == port:
-                return proc
+                return child
             time.sleep(0.5)
         raise AirshipError("Timed out waiting for Tailscale Serve to map `/`.")
     except BaseException:  # incl. Ctrl-C — never orphan the serve child
-        if proc.poll() is None:
-            proc.terminate()
+        if child.proc.poll() is None:
+            child.proc.terminate()
         raise
 
 
@@ -458,7 +526,7 @@ def probe_landing(url: str) -> None:
         out = subprocess.run(
             ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
              "--max-time", "15", url],
-            capture_output=True, text=True, timeout=20,
+            capture_output=True, text=True, timeout=20, check=False,
         )
         code = out.stdout.strip()
     except (subprocess.TimeoutExpired, FileNotFoundError):
@@ -547,7 +615,9 @@ def stage_artifacts(ipa_path: Path, base_url: str, meta: dict[str, str]) -> Path
     # APFS clone: instant like a hardlink, but an immutable snapshot — a
     # rebuild of the source .ipa cannot corrupt an in-flight download.
     clone = subprocess.run(
-        ["cp", "-c", str(ipa_path), str(staging / IPA_NAME)], capture_output=True
+        ["cp", "-c", str(ipa_path), str(staging / IPA_NAME)],
+        capture_output=True,
+        check=False,  # returncode is inspected: nonzero → non-APFS fallback
     )
     if clone.returncode != 0:
         shutil.copy2(ipa_path, staging / IPA_NAME)  # non-APFS fallback
@@ -629,7 +699,7 @@ def make_handler(
             state.note_request()  # every handled request resets the idle clock
             super().log_request(code, size)
 
-        def guess_type(self, path):  # noqa: A003 (matching stdlib signature)
+        def guess_type(self, path):
             for suffix, ctype in CONTENT_TYPES.items():
                 if path.endswith(suffix):
                     return ctype
@@ -677,13 +747,13 @@ def run(
 
     staging: Path | None = None
     server: http.server.ThreadingHTTPServer | None = None
-    serve_proc: subprocess.Popen | None = None
+    serve: ServeChild | None = None
     try:
         staging = stage_artifacts(ipa_path, base_url, meta)
         state = ServerState(self_ips=tailscale_self_ips())
         server, port = start_server(staging, state)
-        serve_proc = start_serve(port, https_port)
-        write_instance(serve_proc.pid)
+        serve = start_serve(port, https_port)
+        write_instance(serve.proc.pid)
 
         _print_handoff(meta, base_url, port)
         probe_landing(f"{base_url}/")
@@ -697,9 +767,9 @@ def run(
 
         while True:
             time.sleep(0.5)
-            if serve_proc.poll() is not None:
+            if serve.proc.poll() is not None:
                 raise AirshipError(
-                    f"tailscale serve exited unexpectedly.\n{_drain(serve_proc)}"
+                    f"tailscale serve exited unexpectedly.\n{serve.output()}"
                 )
             if not stay and state.should_exit(time.monotonic()):
                 ok("Done — cleaning up. Rerun airship if you need the link again.")
@@ -708,12 +778,12 @@ def run(
         print("\n  Stopping.")
     finally:
         signal.signal(signal.SIGINT, signal.SIG_IGN)  # don't let ^C abort cleanup
-        if serve_proc is not None and serve_proc.poll() is None:
-            serve_proc.terminate()
+        if serve is not None and serve.proc.poll() is None:
+            serve.proc.terminate()
             try:
-                serve_proc.wait(timeout=10)
+                serve.proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                serve_proc.kill()
+                serve.proc.kill()
         if server is not None:
             server.shutdown()
             server.server_close()
