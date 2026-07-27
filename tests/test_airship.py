@@ -1,12 +1,15 @@
 """Tests for airship. Run with: uv run pytest
 
-The Gambatte-fixture.ipa fixture is built from a real Tauri iOS build's
-binary Info.plist and real embedded.mobileprovision (real-world data, not
-synthetic), with a placeholder app binary to keep it small.
+The Gambatte-fixture.ipa fixture carries a real Tauri iOS build's binary
+Info.plist (real-world binary-plist parsing coverage) and a placeholder app
+binary to keep it small. Its embedded.mobileprovision is synthetic and
+unsigned: a real profile is CMS-signed and embeds the developer's identity
+and device UDIDs, which do not belong in a public repo.
 """
 
 from __future__ import annotations
 
+import datetime
 import os
 import plistlib
 import shutil
@@ -19,7 +22,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import airship  # noqa: E402
+import airship
 
 FIXTURE = Path(__file__).parent / "fixtures" / "Gambatte-fixture.ipa"
 BASE_URL = "https://example-mac.tail1234.ts.net"
@@ -298,7 +301,7 @@ def test_instance_file_round_trip(instance_file):
 
 
 def test_ensure_root_free_when_nothing_running(instance_file, monkeypatch):
-    monkeypatch.setattr(airship, "serve_status", lambda: {})
+    monkeypatch.setattr(airship, "serve_status", dict)
     airship.ensure_serve_root_free()  # must not raise
 
 
@@ -324,7 +327,7 @@ def test_ensure_root_takes_over_previous_airship(instance_file, monkeypatch):
     monkeypatch.setattr(
         airship, "_terminate_pid", lambda pid: (killed.append(pid), alive.pop(pid, None))
     )
-    monkeypatch.setattr(airship, "serve_status", lambda: {})
+    monkeypatch.setattr(airship, "serve_status", dict)
     airship.ensure_serve_root_free()
     assert killed == [4242]
     assert not instance_file.exists()
@@ -338,10 +341,25 @@ def test_ensure_root_kills_orphaned_serve_child(instance_file, monkeypatch):
     monkeypatch.setattr(
         airship, "_terminate_pid", lambda pid: (killed.append(pid), alive.pop(pid, None))
     )
-    monkeypatch.setattr(airship, "serve_status", lambda: {})
+    monkeypatch.setattr(airship, "serve_status", dict)
     airship.ensure_serve_root_free()
     assert killed == [4243]
     assert not instance_file.exists()
+
+
+def test_ensure_root_returns_cleanly_when_mapping_frees_after_wait(
+    instance_file, monkeypatch
+):
+    # The conflict present during the wait can vanish before the re-inspect
+    # that names it; that must read as "root is free", not a crash.
+    cfg = {
+        "Web": {
+            "h.ts.net:443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:3000"}}}
+        }
+    }
+    statuses = iter([cfg])
+    monkeypatch.setattr(airship, "serve_status", lambda: next(statuses, {}))
+    airship.ensure_serve_root_free()  # must not raise
 
 
 def test_ensure_root_ignores_stale_instance_with_reused_pids(instance_file, monkeypatch):
@@ -350,7 +368,7 @@ def test_ensure_root_ignores_stale_instance_with_reused_pids(instance_file, monk
     monkeypatch.setattr(airship, "_pid_command", lambda pid: "/sbin/launchd")
     killed = []
     monkeypatch.setattr(airship, "_terminate_pid", killed.append)
-    monkeypatch.setattr(airship, "serve_status", lambda: {})
+    monkeypatch.setattr(airship, "serve_status", dict)
     airship.ensure_serve_root_free()
     assert killed == []
     assert not instance_file.exists()
@@ -506,10 +524,7 @@ def _fake_dns(monkeypatch):
 
 def test_base_url_omits_the_default_port(monkeypatch):
     _fake_dns(monkeypatch)
-    assert (
-        airship.tailscale_base_url()
-        == "https://example-mac.tail1234.ts.net"
-    )
+    assert airship.tailscale_base_url() == "https://example-mac.tail1234.ts.net"
 
 
 def test_base_url_appends_a_non_default_port(monkeypatch):
@@ -520,6 +535,181 @@ def test_base_url_appends_a_non_default_port(monkeypatch):
         airship.tailscale_base_url(8444)
         == "https://example-mac.tail1234.ts.net:8444"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Signing preflight (synthetic fixture profile; CMS decode bypassed)
+# --------------------------------------------------------------------------- #
+
+PROFILE_MEMBER = "Payload/Gambatte.app/embedded.mobileprovision"
+KNOWN_IPHONE = "00008120-000A11BB22CC33DD"  # in the fixture's ProvisionedDevices
+
+
+@pytest.fixture
+def warnings(monkeypatch):
+    seen: list[str] = []
+    monkeypatch.setattr(airship, "warn", seen.append)
+    return seen
+
+
+def _fixture_profile() -> dict:
+    with zipfile.ZipFile(FIXTURE) as zf:
+        return plistlib.loads(zf.read(PROFILE_MEMBER))
+
+
+def _preflight(monkeypatch, profile: dict, known: frozenset[str]) -> None:
+    monkeypatch.setattr(airship, "_decode_cms_plist", lambda raw: profile)
+    monkeypatch.setattr(airship, "_known_device_udids", lambda: known)
+    airship.warn_on_signing(FIXTURE, PROFILE_MEMBER)
+
+
+def test_signing_warns_on_expired_profile(warnings, monkeypatch):
+    profile = _fixture_profile()
+    profile["ExpirationDate"] = datetime.datetime(
+        2020, 1, 1, tzinfo=datetime.timezone.utc
+    )
+    _preflight(monkeypatch, profile, frozenset())
+    assert any("EXPIRED" in w for w in warnings)
+
+
+def test_signing_warns_when_profile_has_no_devices(warnings, monkeypatch):
+    profile = _fixture_profile()
+    del profile["ProvisionedDevices"]
+    _preflight(monkeypatch, profile, frozenset({KNOWN_IPHONE}))
+    assert any("ProvisionedDevices" in w for w in warnings)
+
+
+def test_signing_warns_when_no_known_device_is_provisioned(warnings, monkeypatch):
+    _preflight(
+        monkeypatch, _fixture_profile(), frozenset({"00008888-DEADBEEF00000001"})
+    )
+    assert any("install will likely fail" in w for w in warnings)
+
+
+def test_signing_quiet_when_a_known_device_is_provisioned(warnings, monkeypatch):
+    _preflight(monkeypatch, _fixture_profile(), frozenset({KNOWN_IPHONE}))
+    assert warnings == []
+
+
+def test_signing_quiet_when_no_devices_are_known(warnings, monkeypatch):
+    # No discoverable devices → the UDID check is skipped, not a false alarm.
+    _preflight(monkeypatch, _fixture_profile(), frozenset())
+    assert warnings == []
+
+
+def test_decode_cms_plist_rejects_unsigned_input():
+    # The fixture's profile is intentionally NOT CMS-signed; the strict
+    # decoder must return None for it rather than crash or half-parse.
+    with zipfile.ZipFile(FIXTURE) as zf:
+        raw = zf.read(PROFILE_MEMBER)
+    assert airship._decode_cms_plist(raw) is None
+
+
+# --------------------------------------------------------------------------- #
+# Known-device UDID discovery (devicectl JSON primary, xctrace text fallback)
+# --------------------------------------------------------------------------- #
+
+# Shape captured from `xcrun devicectl list devices --json-output` (Xcode 26)
+# on a real Mac; names and identifiers replaced.
+DEVICECTL_JSON = {
+    "result": {
+        "devices": [
+            {
+                "deviceProperties": {"name": "Living Room"},
+                "hardwareProperties": {
+                    "udid": "00008110-000E44FF55AA66EE",
+                    "platform": "tvOS",
+                    "deviceType": "appleTV",
+                },
+            },
+            {
+                "deviceProperties": {"name": "My iPhone"},
+                "hardwareProperties": {
+                    "udid": KNOWN_IPHONE,
+                    "platform": "iOS",
+                    "deviceType": "iPhone",
+                },
+            },
+            {
+                "deviceProperties": {"name": "My iPad"},
+                "hardwareProperties": {
+                    "udid": "00008132-000B77CC88DD99EE",
+                    "platform": "iOS",
+                    "deviceType": "iPad",
+                },
+            },
+            {"deviceProperties": {"name": "half-paired, no hardware info"}},
+        ]
+    }
+}
+
+
+def test_devicectl_udids_keeps_ios_devices_only():
+    udids = airship.parse_devicectl_udids(DEVICECTL_JSON)
+    assert udids == {KNOWN_IPHONE, "00008132-000B77CC88DD99EE"}
+
+
+def test_devicectl_udids_tolerates_empty_and_malformed():
+    assert airship.parse_devicectl_udids({}) == frozenset()
+    assert airship.parse_devicectl_udids({"result": {}}) == frozenset()
+    assert airship.parse_devicectl_udids({"result": {"devices": [{}]}}) == frozenset()
+
+
+# Shape captured from `xcrun xctrace list devices` (Xcode 26) on a real Mac;
+# names and identifiers replaced. Macs and simulators carry standard 5-group
+# UUIDs; iOS-family hardware carries 8-16 UDIDs (legacy devices: 40 hex).
+XCTRACE_OUTPUT = """\
+== Devices ==
+My Mac Studio (BAA35997-5DC4-573D-8E83-C2385813B50A)
+
+== Devices Offline ==
+Living Room (26.4) (00008110-000E44FF55AA66EE)
+My iPhone (27.0) (00008120-000A11BB22CC33DD)
+Old iPhone (12.5) (abcdef0123456789abcdef0123456789abcdef01)
+
+== Simulators ==
+iPhone 17 Simulator (26.0) (E83FD08E-32A4-401D-939C-771FDCD32A1A)
+"""
+
+
+def test_xctrace_udids_finds_hardware_and_skips_macs_and_simulators():
+    assert airship.parse_xctrace_udids(XCTRACE_OUTPUT) == {
+        "00008110-000E44FF55AA66EE",
+        KNOWN_IPHONE,
+        "abcdef0123456789abcdef0123456789abcdef01",
+    }
+
+
+def test_xctrace_udids_empty_output():
+    assert airship.parse_xctrace_udids("") == frozenset()
+
+
+def test_known_udids_trusts_an_empty_devicectl_registry(monkeypatch, tmp_path):
+    # devicectl answering "no iOS devices" is authoritative: no xctrace
+    # second opinion (which would cost another subprocess and could smuggle
+    # in non-iOS hardware).
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        Path(argv[argv.index("--json-output") + 1]).write_text(
+            '{"result": {"devices": []}}'
+        )
+        return type("R", (), {"stdout": ""})()
+
+    monkeypatch.setattr(airship.subprocess, "run", fake_run)
+    assert airship._known_device_udids() == frozenset()
+    assert all("xctrace" not in argv for argv in calls)
+
+
+def test_known_udids_falls_back_to_xctrace_when_devicectl_unusable(monkeypatch):
+    def fake_run(argv, **kwargs):
+        if "devicectl" in argv:
+            raise FileNotFoundError("xcrun")  # e.g. no Xcode CLT devicectl
+        return type("R", (), {"stdout": XCTRACE_OUTPUT})()
+
+    monkeypatch.setattr(airship.subprocess, "run", fake_run)
+    assert KNOWN_IPHONE in airship._known_device_udids()
 
 
 def test_start_serve_passes_https_flag_only_when_non_default(monkeypatch):
@@ -541,7 +731,7 @@ def test_start_serve_passes_https_flag_only_when_non_default(monkeypatch):
         "inspect_serve_root",
         lambda cfg, port=443: ("foreground", "http://127.0.0.1:4190"),
     )
-    monkeypatch.setattr(airship, "serve_status", lambda: {})
+    monkeypatch.setattr(airship, "serve_status", dict)
 
     airship.start_serve(4190)
     assert calls[-1] == ["tailscale", "serve", "4190"]

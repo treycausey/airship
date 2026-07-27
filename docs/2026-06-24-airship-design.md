@@ -157,8 +157,10 @@ In `index.html` the href is written as
   - warn if `ExpirationDate` is in the past;
   - warn if there is no `ProvisionedDevices` array (means an App Store /
     enterprise profile, which cannot install ad-hoc OTA on a registered device);
-  - best-effort: fetch the iPhone's UDID (via `iinfo`) and warn if it is not in
-    `ProvisionedDevices`.
+  - best-effort: gather the UDIDs of iPhones/iPads this Mac has paired with
+    (Xcode's CoreDevice registry via `xcrun devicectl list devices`, falling
+    back to `xcrun xctrace list devices` — both list devices that are offline
+    and uncabled) and warn if none of them is in `ProvisionedDevices`.
 
   These are warnings, not hard failures — proceed but make the likely problem
   visible before the user walks to the phone.
@@ -246,3 +248,23 @@ of truth; this addendum keeps the doc honest):
 - **Shutdown.** SIGINT is handled via KeyboardInterrupt (no double-cleanup
   signal handlers); a second Ctrl-C during cleanup is ignored so teardown
   always finishes; the instance file is removed on exit.
+
+## Addendum — 2026-07-27 public-release revision
+
+- **UDID preflight generalized.** The device-UDID check no longer shells out
+  to a machine-specific helper; it reads Xcode's CoreDevice registry
+  (`xcrun devicectl list devices --json-output`, filtered to iOS-platform
+  devices) with `xcrun xctrace list devices` as a text-parsing fallback. Both
+  list paired devices even when offline/uncabled, which is exactly the
+  airship scenario. The warning now fires when *none* of the Mac's known
+  iPhones/iPads is in `ProvisionedDevices`, and is skipped entirely when no
+  devices are discoverable. Still purely advisory.
+- **Test fixture sanitized.** The fixture IPA keeps a real binary
+  `Info.plist`, but its `embedded.mobileprovision` is now synthetic and
+  unsigned — a real profile is CMS-signed and embeds the developer's
+  identity, Apple team ID, and device UDIDs, which do not belong in a public
+  repo.
+- **Serve-child output** goes to an unlinked temp file instead of a
+  never-drained pipe, so a chatty `tailscale serve` can never block on a
+  full pipe buffer mid-serve.
+- MIT license added; example hostnames throughout the docs and tests.

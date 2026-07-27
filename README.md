@@ -26,8 +26,10 @@ does not build the app.
 - The `.ipa` must be **ad-hoc or development signed** with the iPhone's UDID in
   its provisioning profile. (App Store / enterprise builds cannot install this
   way.) airship warns you before you walk to the phone if the embedded
-  provisioning profile is expired, has no provisioned devices, or does not list
-  this iPhone.
+  provisioning profile is expired, has no provisioned devices, or lists none of
+  the iPhones/iPads this Mac has paired with. (That last check reads Xcode's
+  device registry via `xcrun devicectl` / `xcrun xctrace` when available and is
+  skipped otherwise — the phone does not need to be plugged in.)
 - [`uv`](https://docs.astral.sh/uv/) installed (runs the single-file script and
   its one dependency, `segno`, with no setup).
 
@@ -87,8 +89,9 @@ not a conflict and is left alone.
 
 1. Reads `CFBundleIdentifier` / `CFBundleVersion` / display name from the IPA's
    `Info.plist`.
-2. Stages the IPA (hardlinked, not copied), a `manifest.plist`, and a
-   one-button `index.html` in a temp dir under stable, URL-safe names.
+2. Stages the IPA (APFS-cloned — instant, immutable snapshot; plain-copied on
+   non-APFS filesystems), a `manifest.plist`, and a one-button `index.html`
+   in a temp dir under stable, URL-safe names.
 3. Serves them from `127.0.0.1` (an arbitrary free port, preferring 4190).
 4. Runs `tailscale serve <port>` so `https://<your-node>.ts.net/` proxies to
    it, verifies the mapping actually appears in `tailscale serve status`, and
@@ -105,6 +108,15 @@ can prove ownership: every run writes an instance file (its pid and its
 and taken over, and an orphaned serve child from a crashed run is cleaned up.
 Anything airship cannot prove is its own — including stale-looking mappings —
 is never touched; it refuses and tells you the exact command to clear it.
+
+## Security model
+
+The install page and the IPA are served without authentication to your
+tailnet: while airship is running, any device (and any user) on the tailnet
+can download the app. That is the intended trust model for a personal
+tailnet; if yours is shared, scope access with Tailscale ACLs. Nothing is
+ever exposed to the public internet (airship uses Tailscale Serve, never
+Funnel), and the local HTTP server binds `127.0.0.1` only.
 
 ## Troubleshooting
 
@@ -123,4 +135,9 @@ uv run --with pytest --with segno pytest tests/
 ```
 
 Tests use `tests/fixtures/Gambatte-fixture.ipa`, built from a real iOS build's
-binary `Info.plist` and real `embedded.mobileprovision`.
+binary `Info.plist` plus a synthetic, unsigned provisioning profile (a real
+profile embeds the developer's identity and device UDIDs).
+
+## License
+
+MIT — see [LICENSE](LICENSE).
