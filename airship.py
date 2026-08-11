@@ -7,7 +7,7 @@
 """airship — install a finished iOS .ipa onto your iPhone over the air via Tailscale.
 
 Usage:
-    ./airship.py [app.ipa] [--stay]
+    ./airship.py [app.ipa] [--stay] [--https-port N]
 
 With no argument, serves the newest .ipa found under the current directory.
 
