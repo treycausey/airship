@@ -59,6 +59,9 @@ You'll see something like:
   [ QR code ]
 
   Tailscale IP: 100.x.y.z  (local server on 127.0.0.1:4190)
+  itms link (debug): itms-services://?action=download-manifest&url=https://your-mac.tailXXXXXX.ts.net/manifest.plist
+
+  Reachability: ✓ https://your-mac.tailXXXXXX.ts.net/ answers from this Mac.
   Serving — exits by itself once the phone has downloaded the app and 45s pass (or press Ctrl-C).
 ```
 
