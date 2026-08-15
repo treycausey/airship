@@ -58,12 +58,33 @@ INSTANCE_FILE = Path(tempfile.gettempdir()) / "airship-instance.json"
 IPA_NAME = "app.ipa"
 MANIFEST_NAME = "manifest.plist"
 INDEX_NAME = "index.html"
+ICON_NAME = "icon.svg"
 
 CONTENT_TYPES = {
     ".ipa": "application/octet-stream",
     ".plist": "text/xml",
     ".html": "text/html; charset=utf-8",
+    ".svg": "image/svg+xml",
 }
+
+# Favicon for the install page, embedded rather than shipped as an asset file
+# because airship is one file by design (see CLAUDE.md). SVG only: Safari has
+# supported SVG favicons since 12, and an apple-touch-icon PNG would mean
+# base64 in the source for a page that auto-expires ~45s after the download
+# and is never added to a home screen. Palette is the install page's own.
+ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <rect width="1024" height="1024" fill="#f5f5f7"/>
+  <g transform="rotate(-8 512 512)">
+    <path d="M118 430 L242 512 L118 594 Z" fill="#0071e3"/>
+    <rect x="214" y="356" width="56" height="312" rx="22" fill="#0071e3"/>
+    <path d="M250 512 C 250 394, 428 318, 624 318 C 820 318, 912 426, 942 512
+             C 912 598, 820 706, 624 706 C 428 706, 250 630, 250 512 Z" fill="#0071e3"/>
+    <rect x="536" y="702" width="184" height="86" rx="30" fill="#1d1d1f"/>
+    <rect x="580" y="678" width="22" height="42" fill="#1d1d1f"/>
+    <rect x="654" y="678" width="22" height="42" fill="#1d1d1f"/>
+  </g>
+</svg>
+"""
 
 
 class AirshipError(Exception):
@@ -632,6 +653,8 @@ def build_index_html(base_url: str, meta: dict[str, str]) -> str:
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Install {title}</title>
+<link rel="icon" href="/{ICON_NAME}" type="image/svg+xml">
+<meta name="theme-color" content="#f5f5f7">
 <style>
   body {{ font-family: -apple-system, system-ui, sans-serif; margin: 0;
          display: grid; place-items: center; min-height: 100vh;
@@ -670,6 +693,7 @@ def stage_artifacts(ipa_path: Path, base_url: str, meta: dict[str, str]) -> Path
         shutil.copy2(ipa_path, staging / IPA_NAME)  # non-APFS fallback
     (staging / MANIFEST_NAME).write_bytes(build_manifest(base_url, meta))
     (staging / INDEX_NAME).write_text(build_index_html(base_url, meta))
+    (staging / ICON_NAME).write_text(ICON_SVG)
     return staging
 
 
