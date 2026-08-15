@@ -14,6 +14,7 @@ import os
 import plistlib
 import shutil
 import sys
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -434,6 +435,22 @@ def _get(port: int, path: str, **headers) -> bytes:
         return resp.read()
 
 
+def _wait_until(predicate, timeout=5.0, interval=0.01) -> bool:
+    """Poll `predicate` until it's true or `timeout` seconds pass.
+
+    The handler thread that serves a request stamps ServerState *after* the
+    client already has the full response body (see do_GET in airship.py), so
+    a client-side assertion made immediately after a request returns can race
+    that stamp. Poll instead of reading the state exactly once.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
 def test_server_serves_favicon_for_the_install_page(staged):
     """The install page is opened in Safari on the phone, so its favicon has
     to survive the whole seam: staged into the temp dir, mapped in
@@ -458,6 +475,10 @@ def test_server_marks_download_only_for_remote_full_fetch(staged):
         # verification traffic and must not arm the auto-exit timer.
         _get(port, "/app.ipa")
         _get(port, "/app.ipa", **{"X-Forwarded-For": SELF_IP})
+        # The client sees the response before the handler thread finishes its
+        # own do_GET() and decides whether to stamp state — give it a moment
+        # to settle before asserting the negative.
+        time.sleep(0.05)
         assert state.ipa_downloaded_at is None
         # A 304 conditional response sends no body and must not count.
         with pytest.raises(urllib.error.HTTPError) as exc:
@@ -470,10 +491,15 @@ def test_server_marks_download_only_for_remote_full_fetch(staged):
                 },
             )
         assert exc.value.code == 304
+        time.sleep(0.05)
         assert state.ipa_downloaded_at is None
-        # A full 200 fetch from another tailnet device is the phone.
+        # A full 200 fetch from another tailnet device is the phone. The
+        # handler thread stamps state after the client already sees EOF, so
+        # poll rather than asserting immediately.
         _get(port, "/app.ipa", **{"X-Forwarded-For": PHONE_IP})
-        assert state.ipa_downloaded_at is not None
+        assert _wait_until(lambda: state.ipa_downloaded_at is not None), (
+            "ipa_downloaded_at was never stamped after a full phone fetch"
+        )
     finally:
         server.shutdown()
 
