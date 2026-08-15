@@ -167,6 +167,7 @@ def test_stage_artifacts_writes_url_safe_names():
         assert (staging / "app.ipa").exists()
         assert (staging / "manifest.plist").exists()
         assert (staging / "index.html").exists()
+        assert (staging / "icon.svg").exists()
         # manifest parses and points at the staged ipa name
         parsed = plistlib.loads((staging / "manifest.plist").read_bytes())
         assert parsed["items"][0]["assets"][0]["url"].endswith("/app.ipa")
@@ -181,6 +182,7 @@ def test_handler_sets_correct_content_types(tmp_path):
     # guess_type is a method; check the suffix mapping it relies on
     assert airship.CONTENT_TYPES[".ipa"] == "application/octet-stream"
     assert airship.CONTENT_TYPES[".plist"] == "text/xml"
+    assert airship.CONTENT_TYPES[".svg"] == "image/svg+xml"
     # the handler class is constructed rooted at tmp_path
     assert handler_cls is not None
 
@@ -430,6 +432,21 @@ def _get(port: int, path: str, **headers) -> bytes:
     req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers=headers)
     with urllib.request.urlopen(req) as resp:
         return resp.read()
+
+
+def test_server_serves_favicon_for_the_install_page(staged):
+    """The install page is opened in Safari on the phone, so its favicon has
+    to survive the whole seam: staged into the temp dir, mapped in
+    CONTENT_TYPES, and served by the handler."""
+    server, port = airship.start_server(staged, airship.ServerState())
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/icon.svg")
+        with urllib.request.urlopen(req) as resp:
+            assert resp.headers["Content-Type"] == "image/svg+xml"
+            assert b"<svg" in resp.read()
+        assert b'href="/icon.svg"' in _get(port, "/")
+    finally:
+        server.shutdown()
 
 
 def test_server_marks_download_only_for_remote_full_fetch(staged):

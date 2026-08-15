@@ -99,8 +99,8 @@ not a conflict and is left alone.
 1. Reads `CFBundleIdentifier` / `CFBundleVersion` / display name from the IPA's
    `Info.plist`.
 2. Stages the IPA (APFS-cloned — instant, immutable snapshot; plain-copied on
-   non-APFS filesystems), a `manifest.plist`, and a one-button `index.html`
-   in a temp dir under stable, URL-safe names.
+   non-APFS filesystems), a `manifest.plist`, a one-button `index.html`, and
+   the page's `icon.svg` favicon in a temp dir under stable, URL-safe names.
 3. Serves them from `127.0.0.1` (an arbitrary free port, preferring 4190).
 4. Runs `tailscale serve <port>` so `https://<your-node>.ts.net/` proxies to
    it, verifies the mapping actually appears in `tailscale serve status`, and
