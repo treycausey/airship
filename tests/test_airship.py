@@ -834,3 +834,31 @@ def test_start_serve_passes_https_flag_only_when_non_default(monkeypatch):
 
     airship.start_serve(4190, 8444)
     assert calls[-1] == ["tailscale", "serve", "--https=8444", "4190"]
+
+
+def test_server_answers_every_script_request_with_the_kill_switch_worker(staged):
+    """Regression for a phone whose stale PWA service worker (registered when
+    some app was served from this shared origin) keeps serving that app's
+    cached shell in place of the install page. The worker's update check
+    fetches its own script URL; airship must answer *any* script name with a
+    worker that clears caches, unregisters, and reloads -- and must never
+    cache-pin it."""
+    server, port = airship.start_server(staged, airship.ServerState())
+    try:
+        for path in ("/sw.js", "/service-worker.js", "/assets/workbox-abc123.js?v=2"):
+            req = urllib.request.Request(f"http://127.0.0.1:{port}{path}")
+            with urllib.request.urlopen(req) as resp:
+                assert resp.status == 200
+                assert resp.headers["Content-Type"].startswith("text/javascript")
+                assert resp.headers["Cache-Control"] == "no-store"
+                assert resp.headers["Service-Worker-Allowed"] == "/"
+                body = resp.read().decode()
+            assert "self.skipWaiting()" in body
+            assert "caches.delete(" in body
+            assert "self.registration.unregister()" in body
+            assert "client.navigate(" in body
+        # The rule is only safe because the install page ships no script of
+        # its own; if one is ever added, route the kill switch by name instead.
+        assert b"<script" not in _get(port, "/")
+    finally:
+        server.shutdown()
