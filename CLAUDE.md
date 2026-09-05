@@ -27,6 +27,12 @@ contract other projects rely on — do not break it silently.
   staging dir on exit (and never runs a node-wide `tailscale serve reset`).
   Pass `--stay` to keep it serving indefinitely instead (e.g. for scripted or
   unattended flows where the caller controls the Ctrl-C).
+- **Every `*.js` request gets a kill-switch service worker**, not a 404
+  (`KILL_SWITCH_WORKER` in `airship.py`). It exists to evict a stray PWA
+  worker that another app registered on this shared origin, whose update
+  check fetches its own script URL. This is only safe because the install
+  page ships no JavaScript -- if a script is ever added to the page, route
+  the kill switch by worker name instead of by suffix.
 - **`--https-port N`** picks a different Tailscale Serve HTTPS port. Use this
   when a caller's own project already owns `/` on 443, or when a service
   worker from another app has claimed that origin and would intercept the

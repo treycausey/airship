@@ -67,6 +67,41 @@ CONTENT_TYPES = {
     ".svg": "image/svg+xml",
 }
 
+# Served for ANY `*.js` request. The install page ships no JavaScript of its
+# own, so every script request that reaches airship is a browser updating a
+# service worker that some PWA registered on this origin earlier (443 is
+# shared: flusso did exactly this on 2026-07-24 and its cached shell replaced
+# the install page). A worker's update check fetches its own script URL and
+# installs whatever comes back if the bytes differ, so the reply is a worker
+# whose only job is to clear the caches, unregister, and reload the page onto
+# the real install page. Answering every script name (sw.js, service-worker.js,
+# workbox imports, ...) covers every PWA toolchain without guessing. A phone
+# that cached such a shell BEFORE the offending app learned to disown foreign
+# origins cannot heal itself any other way -- its update fetch used to 404 here.
+KILL_SWITCH_WORKER = """\
+// airship: this origin is an OTA install page, not the app that registered
+// this worker. Clear its caches, hand the origin back, and reload.
+self.addEventListener("install", () => self.skipWaiting());
+self.addEventListener("activate", (event) => {
+  const cleanup = (async () => {
+    await self.clients.claim();
+    for (const key of await caches.keys()) await caches.delete(key);
+    await self.registration.unregister();
+  })();
+  event.waitUntil(cleanup);
+  // Reload only after activation has finished: a navigation waits for an
+  // activating worker to become active, so awaiting navigate() inside
+  // waitUntil() deadlocks (verified in headless Chromium). This worker has
+  // no fetch handler and is already unregistered, so the reload hits the
+  // network and lands on the real install page.
+  cleanup.then(() => setTimeout(async () => {
+    for (const client of await self.clients.matchAll({ type: "window" })) {
+      client.navigate(client.url).catch((err) => console.error("airship: reload failed", err));
+    }
+  }, 100));
+});
+"""
+
 # Favicon for the install page, embedded rather than shipped as an asset file
 # because airship is one file by design (see CLAUDE.md). SVG only: Safari has
 # supported SVG favicons since 12, and an apple-touch-icon PNG would mean
@@ -747,6 +782,9 @@ def make_handler(
             with state.lock:
                 state.in_flight += 1
             try:
+                if self.path.split("?", 1)[0].endswith(".js"):
+                    self._send_kill_switch_worker()
+                    return
                 super().do_GET()
                 # Reached only when the full body streamed without error.
                 if self._is_phone_ipa_download():
@@ -754,6 +792,20 @@ def make_handler(
             finally:
                 with state.lock:
                     state.in_flight -= 1
+
+        def _send_kill_switch_worker(self) -> None:
+            """See KILL_SWITCH_WORKER. `no-store` so the browser re-fetches on
+            every update check instead of pinning a cached copy for 24h."""
+            body = KILL_SWITCH_WORKER.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/javascript; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            # Lets a worker registered at `/` accept this script for that scope
+            # even though the update fetch may be for a nested path.
+            self.send_header("Service-Worker-Allowed", "/")
+            self.end_headers()
+            self.wfile.write(body)
 
         def _is_phone_ipa_download(self) -> bool:
             """A 200, fully-streamed GET of the IPA from another tailnet device.

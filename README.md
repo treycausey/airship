@@ -82,13 +82,24 @@ page, on a device where that app is not running and its dev server is not even
 up. curl the URL from the Mac to tell the two apart: if the Mac gets the install
 page and the phone does not, it is the phone's service worker, not airship.
 
-Fixes, cheapest first:
+airship heals this on its own: it answers every `*.js` request (the install
+page has none of its own) with a tiny service worker that clears the stray
+worker's caches, unregisters it, and reloads the page. A worker checks for
+updates on each navigation by fetching its own script URL, so the first visit
+to the install page swaps the stray worker for the kill switch and the second
+load is the real page — usually within the same visit, since the kill switch
+reloads for you. This works for any PWA toolchain and for any browser's own
+data store (Chrome on iOS keeps one separate from Safari's, with no per-site
+deletion, which is why clearing site data by hand was never a good answer).
 
-- Open the URL in a **Private tab** — iOS Safari does not run service workers there.
+If it still shows the wrong app, cheapest first:
+
+- Open the URL in a **Private / Incognito tab** — no service workers run there.
 - `./airship.py --https-port 8445 …` — a different port is a different origin, so
   a worker registered on 443 cannot intercept it. This is also the answer when
   something legitimately owns `/` on 443 and you would rather not disturb it.
-- Fix the offending app to disown origins it does not serve.
+- Fix the offending app to only register its worker on an origin it owns
+  (flusso does this: `src/lib/sw-origin-guard.ts`).
 
 airship never overwrites another service's Serve mapping: it refuses with
 instructions instead. A mapping on any port *other* than the one it is using is
