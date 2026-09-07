@@ -11,6 +11,15 @@ Usage:
 
 With no argument, serves the newest .ipa found under the current directory.
 
+To stop a backgrounded airship, prefer SIGINT: `pkill -INT -f airship.py`. That
+runs the full cleanup — Serve mapping released, staging dir removed. Signalling
+either pid works; uv forwards SIGINT to the python process it runs.
+
+Avoid `pkill -TERM -f airship.py`. It matches uv's wrapper process as well as
+the python one, and uv responds by killing python before the cleanup finishes,
+which leaks the staging dir under $TMPDIR. A SIGTERM aimed at a single pid
+(either the uv pid or the python pid) is fine.
+
 No cable, no shared WiFi. Both the Mac and the iPhone must be on the same
 Tailscale tailnet, with HTTPS certs enabled. The .ipa must be ad-hoc/development
 signed with the iPhone's UDID in its provisioning profile.
@@ -862,6 +871,17 @@ def run(
     ipa_path: Path, stay: bool = False, https_port: int = DEFAULT_HTTPS_PORT
 ) -> int:
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # so cleanup runs
+    # A shell that starts a job in the background WITHOUT job control (a script,
+    # `sh -c 'airship.py &'`, a non-interactive SSH command) sets SIGINT to SIG_IGN
+    # in the child, and that disposition survives every exec. Python deliberately
+    # skips installing its KeyboardInterrupt handler when it inherits SIG_IGN, so
+    # without this line ^C and `kill -INT`/`pkill -INT` are silently discarded and
+    # the cleanup below never runs — :443 stays held. Re-installing the same handler
+    # CPython would normally use keeps the interactive ^C path identical. (uv itself
+    # forwards SIGINT to this process, so signalling either pid works — but note
+    # that `pkill -TERM` matches uv's wrapper too and uv then kills us before the
+    # cleanup finishes, so SIGINT is the right signal for stopping a background run.)
+    signal.signal(signal.SIGINT, signal.default_int_handler)
     meta = read_ipa_metadata(ipa_path)
     warn_on_signing(ipa_path, meta["embedded_profile"])
 
