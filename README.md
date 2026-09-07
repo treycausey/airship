@@ -70,6 +70,10 @@ confirm. Once the phone has downloaded the IPA, airship prints a confirmation
 and exits on its own after 45 quiet seconds — no need to come back to the
 terminal. Ctrl-C works anytime; `--stay` keeps it serving indefinitely.
 
+To stop a **backgrounded** airship (no TTY), use `pkill -INT -f airship.py`.
+Not `pkill -TERM`: that also signals uv's wrapper process, and uv kills
+airship before its cleanup finishes, leaking the staging dir under `$TMPDIR`.
+
 > Use Safari specifically — `itms-services://` install links do not work in
 > Chrome or other iOS browsers.
 
