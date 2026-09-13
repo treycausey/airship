@@ -10,9 +10,11 @@ and device UDIDs, which do not belong in a public repo.
 from __future__ import annotations
 
 import datetime
+import json
 import os
 import plistlib
 import shutil
+import signal
 import sys
 import time
 import urllib.error
@@ -358,6 +360,96 @@ def test_ensure_root_kills_orphaned_serve_child(instance_file, monkeypatch):
     airship.ensure_serve_root_free()
     assert killed == [4243]
     assert not instance_file.exists()
+
+
+# Regression, 2026-09-13 (orphan from 09-09 blocked the 09-10 Gambatte ship).
+# The command line above is the spelling `tailscale serve` NEVER has on this
+# Mac: /usr/local/bin/tailscale is an `sh` wrapper that execs the app bundle, so
+# `ps -o command=` reports the resolved path below. The old case-sensitive
+# `"tailscale" in cmd` test could not match it, the orphan was never adopted,
+# and airship refused its own leftover for four days.
+GUI_SERVE_COMMAND = "/Applications/Tailscale.app/Contents/MacOS/Tailscale serve 4190"
+
+
+def test_ensure_root_kills_orphan_started_through_the_gui_app_wrapper(
+    instance_file, monkeypatch
+):
+    instance_file.write_text('{"pid": 4242, "serve_pid": 4243}')
+    alive = {4243: GUI_SERVE_COMMAND}
+    monkeypatch.setattr(airship, "_pid_command", lambda pid: alive.get(pid))
+    killed = []
+    monkeypatch.setattr(
+        airship, "_terminate_pid", lambda pid: (killed.append(pid), alive.pop(pid, None))
+    )
+    monkeypatch.setattr(airship, "serve_status", dict)
+    airship.ensure_serve_root_free()
+    assert killed == [4243]
+    assert not instance_file.exists()
+
+
+def test_ensure_root_kills_serve_child_left_by_a_killed_previous_airship(
+    instance_file, monkeypatch
+):
+    # `pkill -f airship.py` hits uv's wrapper too; uv kills python before the
+    # cleanup finishes, so BOTH recorded pids can still be alive. Killing the
+    # airship pid alone leaves the serve child holding `/`.
+    instance_file.write_text('{"pid": 4242, "serve_pid": 4243}')
+    alive = {
+        4242: "uv run --script /Users/me/dev/airship/airship.py --stay app.ipa",
+        4243: GUI_SERVE_COMMAND,
+    }
+    monkeypatch.setattr(airship, "_pid_command", lambda pid: alive.get(pid))
+    killed = []
+    monkeypatch.setattr(
+        airship, "_terminate_pid", lambda pid: (killed.append(pid), alive.pop(pid, None))
+    )
+    monkeypatch.setattr(airship, "serve_status", dict)
+    airship.ensure_serve_root_free()
+    assert killed == [4242, 4243]
+    assert not instance_file.exists()
+
+
+def test_refusal_keeps_the_ownership_record_for_the_next_run(
+    instance_file, monkeypatch
+):
+    # A run that refuses must not erase the record: it is the only proof the
+    # next run has that the leftover is airship's own and may be killed.
+    instance_file.write_text('{"pid": 4242, "serve_pid": 4243}')
+    cfg = {
+        "Foreground": {
+            "sess-1": {
+                "Web": {
+                    "h.ts.net:443": {
+                        "Handlers": {"/": {"Proxy": "http://127.0.0.1:4190"}}
+                    }
+                }
+            }
+        }
+    }
+    monkeypatch.setattr(airship, "serve_status", lambda: cfg)
+    monkeypatch.setattr(airship, "_pid_command", lambda pid: None)  # both pids gone
+    with pytest.raises(airship.AirshipError, match="not overwrite"):
+        airship.ensure_serve_root_free()
+    assert instance_file.exists()
+    assert json.loads(instance_file.read_text())["serve_pid"] == 4243
+
+
+def test_run_installs_sighup_cleanup_handler(monkeypatch):
+    # tmux kill-session SIGHUPs the pane. SIGHUP's default action skips the
+    # cleanup in run()'s finally block and orphans the serve child.
+    installed = {}
+    monkeypatch.setattr(
+        airship.signal, "signal", lambda sig, handler: installed.setdefault(sig, handler)
+    )
+
+    def stop_here(*_args, **_kwargs):
+        raise airship.AirshipError("stop before any real work")
+
+    monkeypatch.setattr(airship, "read_ipa_metadata", stop_here)
+    with pytest.raises(airship.AirshipError, match="stop before"):
+        airship.run(Path("nonexistent.ipa"))
+    assert signal.SIGTERM in installed
+    assert signal.SIGHUP in installed
 
 
 def test_ensure_root_returns_cleanly_when_mapping_frees_after_wait(
