@@ -500,6 +500,21 @@ def _terminate_pid(pid: int) -> None:
         pass
 
 
+def _pid_command_matches(pid: int, needle: str) -> bool:
+    """True when pid is alive and `needle` appears in its command line.
+
+    CASE-INSENSITIVE ON PURPOSE. `/usr/local/bin/tailscale` is a two-line `sh`
+    wrapper that execs `/Applications/Tailscale.app/Contents/MacOS/Tailscale`,
+    and macOS `ps` reports that resolved executable path — which contains no
+    lowercase "tailscale" anywhere. A case-sensitive `"tailscale" in cmd` test
+    is therefore ALWAYS false for a real serve child on this Mac, which is how
+    the orphan from 2026-09-09 (pid 90494, `/Applications/Tailscale.app/
+    Contents/MacOS/Tailscale serve 4190`) survived four days and blocked the
+    Gambatte ship on 09-10 with "Serve already maps `/` on :443".
+    """
+    return needle.lower() in (_pid_command(pid) or "").lower()
+
+
 def _wait_until(predicate, timeout: float, interval: float = 0.5) -> bool:
     deadline = time.monotonic() + timeout
     while True:
@@ -532,10 +547,19 @@ def ensure_serve_root_free(https_port: int = DEFAULT_HTTPS_PORT) -> None:
     killed (its foreground session dies with it). Anything else holding `/`
     belongs to someone else and is never touched — airship refuses with
     instructions instead.
+
+    Both recorded pids are checked, not one or the other: `pkill -f airship.py`
+    matches the `uv run --script` wrapper as well as the python process, and uv
+    then kills python outright, so the run can end with the serve child alive
+    and no cleanup — the 2026-09-09 orphan. The ownership record survives a
+    refusal (it is consumed only once `/` is free), so a run that refuses does
+    not destroy the one piece of evidence the NEXT run needs to adopt the
+    orphan. Before that, a single failed run made the leftover unadoptable and
+    only a manual `kill` could clear it.
     """
     inst = read_instance()
     pid, serve_pid = inst.get("pid"), inst.get("serve_pid")
-    if pid and "airship" in (_pid_command(pid) or ""):
+    if pid and _pid_command_matches(pid, "airship"):
         warn(f"Previous airship still running (pid {pid}) — taking over.")
         _terminate_pid(pid)
         if not _wait_until(lambda: _pid_command(pid) is None, timeout=15):
@@ -543,22 +567,23 @@ def ensure_serve_root_free(https_port: int = DEFAULT_HTTPS_PORT) -> None:
                 f"Previous airship (pid {pid}) did not exit within 15s — "
                 "kill it manually and rerun."
             )
-    elif serve_pid and "tailscale" in (_pid_command(serve_pid) or ""):
+    if serve_pid and _pid_command_matches(serve_pid, "tailscale"):
         warn(
             f"Cleaning up orphaned `tailscale serve` (pid {serve_pid}) "
-            "left by a crashed airship."
+            "left by a previous airship."
         )
         _terminate_pid(serve_pid)
         _wait_until(lambda: _pid_command(serve_pid) is None, timeout=10)
-    INSTANCE_FILE.unlink(missing_ok=True)
 
     # Whatever still maps `/` is not ours. Give teardown a moment, then refuse.
     if _wait_until(
         lambda: inspect_serve_root(serve_status(), https_port) is None, timeout=5
     ):
+        INSTANCE_FILE.unlink(missing_ok=True)  # record consumed; `/` is ours
         return
     found = inspect_serve_root(serve_status(), https_port)
     if found is None:
+        INSTANCE_FILE.unlink(missing_ok=True)
         return  # the conflict freed itself between the last poll and now
     scope, target = found
     raise AirshipError(
@@ -871,6 +896,13 @@ def run(
     ipa_path: Path, stay: bool = False, https_port: int = DEFAULT_HTTPS_PORT
 ) -> int:
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # so cleanup runs
+    # Same for SIGHUP: a backgrounded airship usually lives inside a tmux
+    # window, and `tmux kill-session` SIGHUPs the pane. SIGHUP's default action
+    # terminates the process outright, so without this the `finally` block below
+    # never runs and the foreground `tailscale serve` child is reparented to
+    # launchd still holding `/` on :443. That is how the Gambatte ship sessions
+    # kept stranding serve mappings.
+    signal.signal(signal.SIGHUP, lambda *_: sys.exit(0))
     # A shell that starts a job in the background WITHOUT job control (a script,
     # `sh -c 'airship.py &'`, a non-interactive SSH command) sets SIGINT to SIG_IGN
     # in the child, and that disposition survives every exec. Python deliberately
