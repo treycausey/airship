@@ -301,8 +301,8 @@ def test_proxy_port_parsing():
 
 @pytest.fixture
 def instance_file(monkeypatch, tmp_path):
-    path = tmp_path / "airship-instance.json"
-    monkeypatch.setattr(airship, "INSTANCE_FILE", path)
+    path = tmp_path / f"airship-instance-{airship.DEFAULT_HTTPS_PORT}.json"
+    monkeypatch.setattr(airship, "INSTANCE_DIR", tmp_path)
     # Collapse the wait loops: evaluate the predicate once, no sleeping.
     monkeypatch.setattr(
         airship, "_wait_until", lambda pred, timeout, interval=0.5: pred()
@@ -619,6 +619,60 @@ def test_find_newest_ipa_refuses_home_and_root():
         airship.find_newest_ipa(Path.home())
     with pytest.raises(airship.AirshipError, match="project directory"):
         airship.find_newest_ipa(Path("/"))
+
+
+# --- concurrent ships: per-port records and automatic port choice (#5) ---- #
+
+
+def test_instance_records_are_per_port(instance_file):
+    airship.write_instance(4243, 4443)
+    assert airship.read_instance() == {}  # :443 knows nothing about :4443
+    assert airship.read_instance(4443)["serve_pid"] == 4243
+
+
+def test_auto_port_skips_a_live_airship_without_killing_it(instance_file, monkeypatch):
+    instance_file.write_text('{"pid": 4242, "serve_pid": 4243}')
+    alive = {4242: "python /Users/me/dev/airship/airship.py app.ipa"}
+    monkeypatch.setattr(airship, "_pid_command", lambda pid: alive.get(pid))
+    monkeypatch.setattr(airship, "serve_status", dict)
+    killed = []
+    monkeypatch.setattr(airship, "_terminate_pid", killed.append)
+    assert airship.claim_https_port(None) == 4443
+    assert killed == []  # the other session's ship keeps running
+    assert instance_file.exists()
+
+
+def test_auto_port_skips_a_foreign_service(instance_file, monkeypatch):
+    cfg = {
+        "Web": {
+            "h.ts.net:443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:3000"}}}
+        }
+    }
+    monkeypatch.setattr(airship, "serve_status", lambda: cfg)
+    assert airship.claim_https_port(None) == 4443
+
+
+def test_auto_port_fails_loud_when_every_port_is_taken(instance_file, monkeypatch):
+    cfg = {
+        "Web": {
+            f"h.ts.net:{p}": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:3000"}}}
+            for p in airship.AUTO_HTTPS_PORTS
+        }
+    }
+    monkeypatch.setattr(airship, "serve_status", lambda: cfg)
+    with pytest.raises(airship.AirshipError, match="No free Tailscale Serve HTTPS port"):
+        airship.claim_https_port(None)
+
+
+def test_explicit_port_stays_strict(instance_file, monkeypatch):
+    cfg = {
+        "Web": {
+            "h.ts.net:4443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:3000"}}}
+        }
+    }
+    monkeypatch.setattr(airship, "serve_status", lambda: cfg)
+    with pytest.raises(airship.AirshipError, match="not overwrite"):
+        airship.claim_https_port(4443)
 
 
 # --- --https-port: a different port is a different origin ----------------- #

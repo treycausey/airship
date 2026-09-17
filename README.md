@@ -45,7 +45,7 @@ does not build the app.
 ./airship.py path/to/YourApp.ipa   # explicit path
 ./airship.py                       # newest .ipa under the current directory
 ./airship.py --stay                # keep serving until Ctrl-C (no auto-exit)
-./airship.py --https-port 8445     # serve on a different HTTPS port (see below)
+./airship.py --https-port 8445     # serve on exactly this HTTPS port (see below)
 ```
 
 You'll see something like:
@@ -153,9 +153,16 @@ not a conflict and is left alone.
    node-wide `tailscale serve reset`.
 
 If `/` on your node is already claimed, airship recovers on its own where it
-can prove ownership: every run writes an instance file (its pid and its
-`tailscale serve` child's pid), so a previous airship left running is killed
-and taken over, and an orphaned serve child from a crashed run is cleaned up.
+can prove ownership: every run writes an instance file for its HTTPS port (its
+pid and its `tailscale serve` child's pid), and an orphaned serve child from a
+crashed run is cleaned up.
+
+Several sessions can ship at once. With no `--https-port`, airship tries 443,
+then 4443 through 4449, and takes the first port whose `/` is free. It skips a
+port where another airship is still alive and does not stop that run. It prints
+which ports it skipped and why, and the URL it prints carries the chosen port.
+An explicit `--https-port N` is strict: a previous airship on that port is
+killed and taken over, and anything else on it makes airship refuse.
 Anything airship cannot prove is its own — including stale-looking mappings —
 is never touched; it refuses and tells you the exact command to clear it.
 
