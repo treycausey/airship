@@ -42,6 +42,12 @@ contract other projects rely on — do not break it silently.
   to the newest `.ipa` under the current directory), `--stay`, `--https-port`.
   Treat this as the stable interface; anything else is an implementation
   detail of `airship.py`.
+- **Push notification needs no caller setup.** When airship's own
+  `.env.local` holds `PUSHOVER_TOKEN` / `PUSHOVER_USER`, it sends a Pushover
+  notification that links to the install page once the page is live. It
+  reads those keys through `varlock run --path <airship dir>`, not from the
+  caller's environment. A failed send prints a warning and never stops the
+  run.
 
 ## Cross-project usage
 

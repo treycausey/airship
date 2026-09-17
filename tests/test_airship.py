@@ -954,3 +954,99 @@ def test_server_answers_every_script_request_with_the_kill_switch_worker(staged)
         assert b"<script" not in _get(port, "/")
     finally:
         server.shutdown()
+
+
+# --------------------------------------------------------------------------- #
+# Push notification (real sh + curl; stub varlock, local stand-in for Pushover)
+# --------------------------------------------------------------------------- #
+
+
+FAKE_VARLOCK = """#!/bin/sh
+# Stub: drop everything up to `--`, inject fake credentials, run the rest.
+while [ "$1" != "--" ]; do shift; done; shift
+PUSHOVER_TOKEN=tok123 PUSHOVER_USER=usr456 exec "$@"
+"""
+
+
+def _fake_pushover(reply: bytes):
+    import http.server
+    import threading
+
+    received: list[dict] = []
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            from urllib.parse import parse_qs
+
+            body = self.rfile.read(int(self.headers["Content-Length"])).decode()
+            received.append({k: v[0] for k, v in parse_qs(body).items()})
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(reply)
+
+        def log_message(self, *a):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, received
+
+
+@pytest.fixture
+def notify_env(tmp_path, monkeypatch):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "varlock").write_text(FAKE_VARLOCK)
+    (bin_dir / "varlock").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    env_dir = tmp_path / "airship"
+    env_dir.mkdir()
+    (env_dir / ".env.local").write_text("")
+    return env_dir
+
+
+META = {"title": "Gam & bat", "version": "1.2", "bundle_id": "com.x.y"}
+
+
+def test_notify_posts_encoded_fields_with_secrets_off_argv(notify_env, monkeypatch, capsys):
+    server, received = _fake_pushover(b'{"status":1,"request":"r"}')
+    monkeypatch.setattr(airship, "PUSHOVER_URL", f"http://127.0.0.1:{server.server_port}/")
+    argv = airship.pushover_argv(f"{BASE_URL}/", META, notify_env)
+    assert not any("tok123" in a or "usr456" in a for a in argv)
+
+    airship.notify_ready(f"{BASE_URL}/", META, notify_env)
+    server.shutdown()
+
+    assert received == [{
+        "token": "tok123",
+        "user": "usr456",
+        "title": "Gam & bat v1.2 is ready",
+        "message": "com.x.y — tap to open the install page, then tap Install.",
+        "url": f"{BASE_URL}/",
+        "url_title": "Install Gam & bat",
+    }]
+    assert "sent via Pushover" in capsys.readouterr().out
+
+
+def test_notify_warns_when_pushover_rejects(notify_env, monkeypatch, capsys):
+    server, _ = _fake_pushover(b'{"status":0,"errors":["application token is invalid"]}')
+    monkeypatch.setattr(airship, "PUSHOVER_URL", f"http://127.0.0.1:{server.server_port}/")
+    airship.notify_ready(f"{BASE_URL}/", META, notify_env)
+    server.shutdown()
+    assert "token is invalid" in capsys.readouterr().err
+
+
+def test_notify_off_without_env_local(tmp_path, capsys):
+    airship.notify_ready(f"{BASE_URL}/", META, tmp_path)
+    assert "Push notification: off" in capsys.readouterr().out
+
+
+def test_notify_warns_when_env_local_cannot_be_checked(tmp_path, monkeypatch, capsys):
+    # An agent sandbox that denies reads of .env.local makes stat() raise.
+    # That must not crash an install run.
+    def denied(self):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(airship.Path, "exists", denied)
+    airship.notify_ready(f"{BASE_URL}/", META, tmp_path)
+    assert "Push notification skipped" in capsys.readouterr().err

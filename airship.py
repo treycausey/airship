@@ -678,6 +678,68 @@ def probe_landing(url: str) -> None:
         )
 
 
+# Push notification. Credentials live in airship's OWN Varlock `.env.local`
+# (next to this file), not the caller's environment: airship runs from other
+# projects' directories, so it resolves them with `varlock run --path`. The
+# secrets reach curl on stdin via printf (a shell builtin), never on an argv
+# that `ps` would show.
+PUSHOVER_URL = "https://api.pushover.net/1/messages.json"
+_PUSHOVER_SH = (
+    'printf "token=%s&user=%s" "$PUSHOVER_TOKEN" "$PUSHOVER_USER" | '
+    'curl -sS --max-time 15 --data-binary @- '
+    '--data-urlencode "title=$1" --data-urlencode "message=$2" '
+    '--data-urlencode "url=$3" --data-urlencode "url_title=$4" "$5"'
+)
+
+
+def pushover_argv(landing: str, meta: dict[str, str], env_dir: Path) -> list[str]:
+    title = f"{meta['title']} v{meta['version']} is ready"
+    message = f"{meta['bundle_id']} — tap to open the install page, then tap Install."
+    return [
+        "varlock", "run", "--path", str(env_dir),
+        "--filter", "PUSHOVER_TOKEN,PUSHOVER_USER", "--",
+        "sh", "-c", _PUSHOVER_SH, "airship-notify",
+        title[:250], message[:1024], landing, f"Install {meta['title']}"[:100],
+        PUSHOVER_URL,
+    ]
+
+
+def notify_ready(landing: str, meta: dict[str, str], env_dir: Path) -> None:
+    """Send a Pushover notification whose link opens the install page.
+    Off (with a note) when airship has no `.env.local`; every failure after
+    that is a visible warning. Never fails the run: the URL and QR code are
+    already on screen."""
+    env_local = env_dir / ".env.local"
+    try:
+        configured = env_local.exists()
+    except OSError as exc:  # e.g. an agent sandbox that denies stat on it
+        warn(f"Push notification skipped: cannot check {env_local}: {exc}")
+        return
+    if not configured:
+        print(f"  Push notification: off (no {env_local}).")
+        return
+    if shutil.which("varlock") is None:
+        warn("Push notification skipped: `varlock` not found on PATH.")
+        return
+    try:
+        out = subprocess.run(
+            pushover_argv(landing, meta, env_dir),
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        warn("Push notification failed: Pushover did not answer within 30s.")
+        return
+    try:
+        sent = out.returncode == 0 and json.loads(out.stdout).get("status") == 1
+    except (json.JSONDecodeError, AttributeError):
+        sent = False
+    if sent:
+        print("  Push notification: \033[32m✓\033[0m sent via Pushover.")
+    else:
+        detail = _printable((out.stdout + out.stderr).strip())[:500]
+        warn(f"Push notification failed (exit {out.returncode}): {detail}")
+
+
 # --------------------------------------------------------------------------- #
 # Artifact staging
 # --------------------------------------------------------------------------- #
@@ -932,6 +994,7 @@ def run(
 
         _print_handoff(meta, base_url, port)
         probe_landing(f"{base_url}/")
+        notify_ready(f"{base_url}/", meta, Path(__file__).resolve().parent)
         if stay:
             print("\n  Serving — press Ctrl-C when the install finishes.")
         else:
