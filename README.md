@@ -77,6 +77,32 @@ airship before its cleanup finishes, leaking the staging dir under `$TMPDIR`.
 > Use Safari specifically — `itms-services://` install links do not work in
 > Chrome or other iOS browsers.
 
+### Push notification (optional)
+
+When the install page is live, airship can send a [Pushover](https://pushover.net)
+notification whose link opens that page, so you do not need the terminal or
+the QR code. Set it up once:
+
+1. On pushover.net, create an application for airship and copy its API token.
+   Copy your user key from the dashboard too.
+2. Put both values in `.env.local` next to `airship.py` (git-ignored,
+   declared in `.env.schema`):
+
+   ```sh
+   cd ~/dev/airship && umask 077 \
+     && read -rs "t?Pushover app token: " && echo \
+     && read -rs "u?Pushover user key: " && echo \
+     && printf 'PUSHOVER_TOKEN=%s\nPUSHOVER_USER=%s\n' "$t" "$u" >| .env.local \
+     && unset t u && varlock load
+   ```
+
+airship reads these values with `varlock run --path <airship dir>`, so the
+notification works whichever directory you call airship from. With no
+`.env.local`, airship prints `Push notification: off` and continues. If a
+send fails, airship prints a warning and keeps serving. Install links work
+only in Safari: if the link opens in another browser view and **Install**
+does nothing, open the same page in Safari.
+
 ### If the phone shows a different app at that URL
 
 443 is a **shared origin**. A PWA served from your Mac's bare `ts.net` address
