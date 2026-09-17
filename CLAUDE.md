@@ -33,7 +33,14 @@ contract other projects rely on — do not break it silently.
   check fetches its own script URL. This is only safe because the install
   page ships no JavaScript -- if a script is ever added to the page, route
   the kill switch by worker name instead of by suffix.
-- **`--https-port N`** picks a different Tailscale Serve HTTPS port. Use this
+- **The HTTPS port is chosen automatically when `--https-port` is absent.**
+  airship tries `DEFAULT_HTTPS_PORT`, then the rest of `AUTO_HTTPS_PORTS` in
+  `airship.py`, and takes the first port whose `/` is free, so several sessions
+  can ship at once. It never stops another live airship in this mode. Callers
+  must read the URL airship prints; do not assume 443.
+- **`--https-port N`** pins one Tailscale Serve HTTPS port and is strict:
+  airship takes over a previous airship on that port and refuses if anything
+  else owns `/` there. Use this
   when a caller's own project already owns `/` on 443, or when a service
   worker from another app has claimed that origin and would intercept the
   install page — a different port is a different origin. Default is defined

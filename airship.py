@@ -61,7 +61,12 @@ SKIP_DIRS = {"node_modules"}  # pruned (with dotdirs) during no-arg .ipa discove
 
 # Ownership marker: lets the next run positively identify this run's processes
 # (previous airship, or an orphaned serve child after a crash) without guessing.
-INSTANCE_FILE = Path(tempfile.gettempdir()) / "airship-instance.json"
+# One record per HTTPS port, so concurrent runs on different ports never mistake
+# each other for a leftover and SIGTERM a live ship.
+INSTANCE_DIR = Path(tempfile.gettempdir())
+
+# Ports tried in order when the caller does not pass --https-port.
+AUTO_HTTPS_PORTS = (DEFAULT_HTTPS_PORT, 4443, 4444, 4445, 4446, 4447, 4448, 4449)
 
 # Stable, URL-safe staged filenames (never the original IPA basename).
 IPA_NAME = "app.ipa"
@@ -525,15 +530,19 @@ def _wait_until(predicate, timeout: float, interval: float = 0.5) -> bool:
         time.sleep(interval)
 
 
-def read_instance() -> dict:
+def instance_path(https_port: int = DEFAULT_HTTPS_PORT) -> Path:
+    return INSTANCE_DIR / f"airship-instance-{https_port}.json"
+
+
+def read_instance(https_port: int = DEFAULT_HTTPS_PORT) -> dict:
     try:
-        return json.loads(INSTANCE_FILE.read_text())
+        return json.loads(instance_path(https_port).read_text())
     except (OSError, json.JSONDecodeError):
         return {}
 
 
-def write_instance(serve_pid: int) -> None:
-    INSTANCE_FILE.write_text(
+def write_instance(serve_pid: int, https_port: int = DEFAULT_HTTPS_PORT) -> None:
+    instance_path(https_port).write_text(
         json.dumps({"pid": os.getpid(), "serve_pid": serve_pid})
     )
 
@@ -557,7 +566,7 @@ def ensure_serve_root_free(https_port: int = DEFAULT_HTTPS_PORT) -> None:
     orphan. Before that, a single failed run made the leftover unadoptable and
     only a manual `kill` could clear it.
     """
-    inst = read_instance()
+    inst = read_instance(https_port)
     pid, serve_pid = inst.get("pid"), inst.get("serve_pid")
     if pid and _pid_command_matches(pid, "airship"):
         warn(f"Previous airship still running (pid {pid}) — taking over.")
@@ -579,11 +588,11 @@ def ensure_serve_root_free(https_port: int = DEFAULT_HTTPS_PORT) -> None:
     if _wait_until(
         lambda: inspect_serve_root(serve_status(), https_port) is None, timeout=5
     ):
-        INSTANCE_FILE.unlink(missing_ok=True)  # record consumed; `/` is ours
+        instance_path(https_port).unlink(missing_ok=True)  # record consumed; `/` is ours
         return
     found = inspect_serve_root(serve_status(), https_port)
     if found is None:
-        INSTANCE_FILE.unlink(missing_ok=True)
+        instance_path(https_port).unlink(missing_ok=True)
         return  # the conflict freed itself between the last poll and now
     scope, target = found
     raise AirshipError(
@@ -592,6 +601,47 @@ def ensure_serve_root_free(https_port: int = DEFAULT_HTTPS_PORT) -> None:
         f"clear it with `tailscale serve --https={https_port} off`; otherwise "
         f"stop the service that owns it, or pick a free port with "
         f"`--https-port <n>`."
+    )
+
+
+def claim_https_port(requested: int | None) -> int:
+    """Return the HTTPS port this run owns, with `/` on it free.
+
+    An explicit `--https-port` is strict: takeover of a previous airship on
+    that port, refusal when anything else holds it. With no port given, walk
+    AUTO_HTTPS_PORTS and take the first usable one, so several sessions can
+    ship at once. A port where another airship is still alive is skipped, not
+    taken over — that run belongs to another session. A port with a dead
+    airship's record still gets the orphan cleanup.
+    """
+    if requested is not None:
+        ensure_serve_root_free(requested)
+        return requested
+    refusals: list[str] = []
+    for port in AUTO_HTTPS_PORTS:
+        inst = read_instance(port)
+        pid = inst.get("pid")
+        if pid and _pid_command_matches(pid, "airship"):
+            refusals.append(f":{port} another airship is serving (pid {pid})")
+            continue
+        if not inst:
+            found = inspect_serve_root(serve_status(), port)
+            if found is not None:  # foreign owner: no point waiting for teardown
+                refusals.append(f":{port} `/` maps to {found[1]} ({found[0]})")
+                continue
+        try:
+            ensure_serve_root_free(port)
+        except AirshipError as exc:
+            refusals.append(f":{port} {exc}")
+            continue
+        if port != DEFAULT_HTTPS_PORT:
+            warn(f"Using HTTPS port {port} — " + "; ".join(refusals) + ".")
+        return port
+    raise AirshipError(
+        "No free Tailscale Serve HTTPS port among "
+        f"{', '.join(map(str, AUTO_HTTPS_PORTS))}:\n  "
+        + "\n  ".join(refusals)
+        + "\nPass `--https-port <n>` with a port you know is free."
     )
 
 
@@ -954,9 +1004,7 @@ def start_server(
 # --------------------------------------------------------------------------- #
 
 
-def run(
-    ipa_path: Path, stay: bool = False, https_port: int = DEFAULT_HTTPS_PORT
-) -> int:
+def run(ipa_path: Path, stay: bool = False, https_port: int | None = None) -> int:
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # so cleanup runs
     # Same for SIGHUP: a backgrounded airship usually lives inside a tmux
     # window, and `tmux kill-session` SIGHUPs the pane. SIGHUP's default action
@@ -979,8 +1027,8 @@ def run(
     meta = read_ipa_metadata(ipa_path)
     warn_on_signing(ipa_path, meta["embedded_profile"])
 
+    https_port = claim_https_port(https_port)
     base_url = tailscale_base_url(https_port)
-    ensure_serve_root_free(https_port)
 
     staging: Path | None = None
     server: http.server.ThreadingHTTPServer | None = None
@@ -990,7 +1038,7 @@ def run(
         state = ServerState(self_ips=tailscale_self_ips())
         server, port = start_server(staging, state)
         serve = start_serve(port, https_port)
-        write_instance(serve.proc.pid)
+        write_instance(serve.proc.pid, https_port)
 
         _print_handoff(meta, base_url, port)
         probe_landing(f"{base_url}/")
@@ -1029,7 +1077,7 @@ def run(
             server.server_close()
         if staging is not None:
             shutil.rmtree(staging, ignore_errors=True)
-        INSTANCE_FILE.unlink(missing_ok=True)
+        instance_path(https_port).unlink(missing_ok=True)
     return 0
 
 
@@ -1071,11 +1119,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--https-port",
         type=int,
-        default=DEFAULT_HTTPS_PORT,
+        default=None,
         metavar="N",
         help=(
-            f"Tailscale Serve HTTPS port (default {DEFAULT_HTTPS_PORT}). Use a "
-            "different port when something already owns `/` on the default, or "
+            f"Tailscale Serve HTTPS port. Default: {DEFAULT_HTTPS_PORT}, or the "
+            f"next free port of {', '.join(map(str, AUTO_HTTPS_PORTS[1:]))} when "
+            "it is taken. An explicit port is strict: airship fails if it is "
+            "not free. Use one "
+            "when a caller needs a fixed URL, or "
             "when a service worker from another project has claimed that origin "
             "— a different port is a different origin, so it cannot intercept "
             "the install page."

@@ -226,9 +226,13 @@ of truth; this addendum keeps the doc honest):
   instead of a plain copy: instant like a hardlink, but an immutable snapshot,
   so rebuilding the source `.ipa` mid-serve cannot corrupt an in-flight
   download.
-- **Ownership marker.** Every run writes `$TMPDIR/airship-instance.json`
-  (airship pid + `tailscale serve` child pid). On startup, a previous airship
-  found alive via that file is SIGTERMed and taken over; an orphaned serve
+- **Ownership marker.** Every run writes `$TMPDIR/airship-instance-<port>.json`
+  (airship pid + `tailscale serve` child pid), one record per HTTPS port
+  (2026-09-17, issue #5: one global record made a second run SIGTERM a live
+  ship on another port). With an explicit `--https-port`, a previous airship
+  found alive via that port's file is SIGTERMed and taken over. With no port
+  given, airship walks `AUTO_HTTPS_PORTS` and skips a port whose airship is
+  alive, so concurrent sessions coexist. In both modes an orphaned serve
   child from a crashed run is killed (its foreground Serve session dies with
   it). Ownership is proven by the instance file plus a `ps` command-line
   check — never guessed from port probing. Step 4's rule is otherwise
