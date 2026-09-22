@@ -58,10 +58,10 @@ contract other projects rely on — do not break it silently.
 
 ## Cross-project usage
 
-The `ios-ship` and `ios-deploy-policy` skills (in `~/.claude/skills/`) encode
+The `apple-ship` skill (in `~/.claude/skills/`) encodes
 how other projects are expected to invoke airship end to end — keychain
 preflight, packaging the `.ipa` from an `.xcarchive`, XcodeGen regeneration,
-Tailscale-up checks, and the airship handoff itself. Consult those skills
+Tailscale-up checks, and the airship handoff itself. Consult that skill
 before wiring a new project's device-install flow instead of re-deriving the
 sequence here.
 
