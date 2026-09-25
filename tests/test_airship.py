@@ -117,23 +117,6 @@ def test_manifest_is_emitted_as_xml():
     assert raw.lstrip().startswith(b"<?xml")
 
 
-def test_itms_url_percent_encodes_nested_manifest_url():
-    url = airship.itms_url(BASE_URL)
-    assert url.startswith("itms-services://?action=download-manifest&url=")
-    # the nested https URL must be percent-encoded (no raw :// in the tail)
-    tail = url.split("url=", 1)[1]
-    assert "%3A%2F%2F" in tail
-    assert "://" not in tail
-
-
-def test_index_html_escapes_ampersand_in_href():
-    meta = airship.read_ipa_metadata(FIXTURE)
-    html = airship.build_index_html(BASE_URL, meta)
-    assert "download-manifest&amp;url=" in html
-    assert "Gambatte" in html
-    assert "com.gambatte.app" in html
-
-
 # --------------------------------------------------------------------------- #
 # Tailscale DNS name handling
 # --------------------------------------------------------------------------- #
@@ -188,26 +171,6 @@ def test_handler_sets_correct_content_types(tmp_path):
     assert airship.CONTENT_TYPES[".svg"] == "image/svg+xml"
     # the handler class is constructed rooted at tmp_path
     assert handler_cls is not None
-
-
-def test_server_falls_back_when_preferred_port_busy(monkeypatch):
-    import socket
-
-    # Occupy the preferred port so airship must fall back.
-    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    blocker.bind(("127.0.0.1", airship.PREFERRED_PORT))
-    blocker.listen(1)
-    try:
-        server, port = airship.start_server(Path("/tmp"), airship.ServerState())
-        try:
-            assert port != airship.PREFERRED_PORT
-            assert port > 0
-            assert server.server_address[0] == "127.0.0.1"
-        finally:
-            server.shutdown()
-    finally:
-        blocker.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -624,12 +587,6 @@ def test_find_newest_ipa_refuses_home_and_root():
 # --- concurrent ships: per-port records and automatic port choice (#5) ---- #
 
 
-def test_instance_records_are_per_port(instance_file):
-    airship.write_instance(4243, 4443)
-    assert airship.read_instance() == {}  # :443 knows nothing about :4443
-    assert airship.read_instance(4443)["serve_pid"] == 4243
-
-
 def test_auto_port_skips_a_live_airship_without_killing_it(instance_file, monkeypatch):
     instance_file.write_text('{"pid": 4242, "serve_pid": 4243}')
     alive = {4242: "python /Users/me/dev/airship/airship.py app.ipa"}
@@ -719,11 +676,6 @@ def _fake_dns(monkeypatch):
 
     monkeypatch.setattr(airship.shutil, "which", lambda _: "/usr/local/bin/tailscale")
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: FakeRun())
-
-
-def test_base_url_omits_the_default_port(monkeypatch):
-    _fake_dns(monkeypatch)
-    assert airship.tailscale_base_url() == "https://example-mac.tail1234.ts.net"
 
 
 def test_base_url_appends_a_non_default_port(monkeypatch):

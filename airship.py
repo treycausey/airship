@@ -48,7 +48,41 @@ from html import escape
 from pathlib import Path
 from urllib.parse import quote
 
-PREFERRED_PORT = 4190  # airship's allocated dev-server block
+
+def _env_override(name: str) -> str | None:
+    """Read an env-var override, treating an empty value the same as unset —
+    `FOO=` in a shell or a blank value in a launched env dict must fall back
+    to the default, not silently become `""` (which for a path override would
+    resolve to the current directory, and for a port override would crash
+    `int("")` with an unreadable traceback at import time)."""
+    raw = os.environ.get(name)
+    return raw if raw else None
+
+
+def _env_port(name: str, default: int) -> int:
+    raw = _env_override(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        sys.exit(f"✗ {name}={raw!r} is not a valid integer port.")
+    if not (0 <= value <= 65535):
+        sys.exit(f"✗ {name}={raw!r} must be a port between 0 and 65535.")
+    return value
+
+
+def _env_path(name: str, default: Path) -> Path:
+    raw = _env_override(name)
+    return Path(raw) if raw is not None else default
+
+
+# AIRSHIP_PREFERRED_PORT overrides this (default: 4190, airship's allocated
+# dev-server block, unchanged). Exists so the e2e suite (tests/e2e/) can force
+# a real airship.py subprocess to hit the "preferred port already taken"
+# fallback deterministically, instead of depending on whatever else happens
+# to be running on 4190 on the machine the suite runs on.
+PREFERRED_PORT = _env_port("AIRSHIP_PREFERRED_PORT", 4190)
 # The HTTPS port Tailscale Serve publishes on. 443 is the tailnet default and
 # the right answer almost always — but it is a SHARED origin, and a service
 # worker registered there by any other project will serve its own cached shell
@@ -63,7 +97,11 @@ SKIP_DIRS = {"node_modules"}  # pruned (with dotdirs) during no-arg .ipa discove
 # (previous airship, or an orphaned serve child after a crash) without guessing.
 # One record per HTTPS port, so concurrent runs on different ports never mistake
 # each other for a leftover and SIGTERM a live ship.
-INSTANCE_DIR = Path(tempfile.gettempdir())
+# AIRSHIP_INSTANCE_DIR overrides where this lives (default: the system temp
+# dir, unchanged). Exists so the e2e suite (tests/e2e/) can point a real
+# airship.py subprocess at a throwaway directory instead of ever touching a
+# real machine's live instance records.
+INSTANCE_DIR = _env_path("AIRSHIP_INSTANCE_DIR", Path(tempfile.gettempdir()))
 
 # Ports tried in order when the caller does not pass --https-port.
 AUTO_HTTPS_PORTS = (DEFAULT_HTTPS_PORT, 4443, 4444, 4445, 4446, 4447, 4448, 4449)

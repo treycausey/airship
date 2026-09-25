@@ -196,6 +196,47 @@ Tests use `tests/fixtures/Gambatte-fixture.ipa`, built from a real iOS build's
 binary `Info.plist` plus a synthetic, unsigned provisioning profile (a real
 profile embeds the developer's identity and device UDIDs).
 
+### End-to-end suite
+
+`tests/e2e/` spawns a real `airship.py` subprocess and drives it over real
+HTTPS with `httpx` — no browser, no real Tailscale, no real Pushover network
+access. Fakes for `tailscale`, `varlock`, `curl`, `xcrun`, and `security`
+(`tests/e2e/fake_*.py`) stand in for the real ones: `tailscale` terminates
+TLS with a throwaway self-signed cert and proxies to airship's local HTTP
+server exactly like `tailscale serve` does; `varlock` and `curl` block
+anything that isn't a loopback request (so a real `.env.local` sitting next
+to the script under test can never result in a real Pushover push); `xcrun`
+and `security` are stubbed as belt-and-suspenders. The child process also
+gets a dead proxy (`HTTP(S)_PROXY=http://127.0.0.1:9`) and `UV_OFFLINE=1`, so
+nothing it does can reach the real network even if a fake were bypassed.
+These tests are slower (they start a real process and do a real TLS
+handshake) and excluded from the default run (`-m "not e2e"` in
+`pytest.ini`). Run them explicitly:
+
+```sh
+uv run --with pytest --with segno --with httpx pytest -m e2e tests/
+```
+
+Two env vars exist solely so this suite can isolate a real airship.py run
+from the machine it's running on; their defaults reproduce today's hardcoded
+behavior exactly, an empty value is treated as unset (falls back to the
+default, never becomes the current directory or an unhandled crash), and
+`AIRSHIP_PREFERRED_PORT` is range-checked (0–65535) with a readable error
+naming the variable on bad input:
+
+- `AIRSHIP_INSTANCE_DIR` — where `airship-instance-<port>.json` lives.
+  Default: the system temp dir (unchanged). The suite points this at a
+  throwaway directory so it never reads or writes a real instance record.
+- `AIRSHIP_PREFERRED_PORT` — the local HTTP server's preferred port before
+  falling back to an OS-assigned one. Default: `4190` (unchanged). The suite
+  always sets this to a port it chose itself (never touching the real,
+  currently-live ships on 4190/4443/4444), and uses it to force the fallback
+  path deterministically in the free-port test.
+
+`.githooks/pre-commit` runs this suite automatically for a commit that
+touches `airship.py`, `tests/`, or a dependency file. Enable it with
+`git config core.hooksPath .githooks`.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
