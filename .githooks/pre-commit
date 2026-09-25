@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Pre-commit hook: run the airship e2e suite when a commit touches code that
+# could break it (airship.py itself, the test suite, or the dependency
+# declarations pytest/uv resolve against). Skipped for commits that don't
+# touch any of those, so an unrelated doc or README change stays fast.
+#
+# Enable with: git config core.hooksPath .githooks
+set -euo pipefail
+
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:$HOME/.bun/bin:$PATH"
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+
+relevant=$(printf '%s\n' "$staged" | grep -E \
+  '^(airship\.py|tests/.*|pytest\.ini|pyproject\.toml|uv\.lock)$' \
+  || true)
+
+if [ -z "$relevant" ]; then
+    exit 0
+fi
+
+echo "pre-commit: staged changes touch airship.py, tests, or dependencies — running the e2e suite:"
+printf '  %s\n' $relevant
+
+if ! uv run --with pytest --with segno --with httpx pytest -m e2e tests/; then
+    echo
+    echo "pre-commit: e2e suite FAILED — commit blocked." >&2
+    echo "Fix the failure, or run with --no-verify if you are certain this commit is safe." >&2
+    exit 1
+fi
+
+exit 0
