@@ -4,7 +4,12 @@
 # declarations pytest/uv resolve against). Skipped for commits that don't
 # touch any of those, so an unrelated doc or README change stays fast.
 #
-# Enable with: git config core.hooksPath .githooks
+# This file is picked up automatically: this repo's global git hook
+# (~/.config/git/hooks/pre-commit, via core.hooksPath) runs its own secret
+# scans first, then execs this file if it exists and is executable. No
+# core.hooksPath change is needed, and none should be made -- that would
+# skip the global hook's secret scanning entirely instead of layering on
+# top of it.
 set -euo pipefail
 
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:$HOME/.bun/bin:$PATH"
