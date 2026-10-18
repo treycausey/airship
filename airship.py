@@ -773,10 +773,12 @@ def probe_landing(url: str) -> None:
 # that `ps` would show.
 PUSHOVER_URL = "https://api.pushover.net/1/messages.json"
 _PUSHOVER_SH = (
+    # squillo (~/dev/squillo) serves the same API; PUSHOVER_BASE_URL points there.
+    'u="$5"; [ -n "${PUSHOVER_BASE_URL:-}" ] && u="${PUSHOVER_BASE_URL%/}/1/messages.json"; '
     'printf "token=%s&user=%s" "$PUSHOVER_TOKEN" "$PUSHOVER_USER" | '
     'curl -sS --max-time 15 --data-binary @- '
     '--data-urlencode "title=$1" --data-urlencode "message=$2" '
-    '--data-urlencode "url=$3" --data-urlencode "url_title=$4" "$5"'
+    '--data-urlencode "url=$3" --data-urlencode "url_title=$4" "$u"'
 )
 
 
@@ -785,7 +787,7 @@ def pushover_argv(landing: str, meta: dict[str, str], env_dir: Path) -> list[str
     message = f"{meta['bundle_id']} — tap to open the install page, then tap Install."
     return [
         "varlock", "run", "--path", str(env_dir),
-        "--filter", "PUSHOVER_TOKEN,PUSHOVER_USER", "--",
+        "--filter", "PUSHOVER_TOKEN,PUSHOVER_USER,PUSHOVER_BASE_URL", "--",
         "sh", "-c", _PUSHOVER_SH, "airship-notify",
         title[:250], message[:1024], landing, f"Install {meta['title']}"[:100],
         PUSHOVER_URL,
