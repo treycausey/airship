@@ -85,16 +85,15 @@ the QR code. Set it up once:
 
 1. On pushover.net, create an application for airship and copy its API token.
    Copy your user key from the dashboard too.
-2. Put both values in `.env.local` next to `airship.py` (git-ignored,
-   declared in `.env.schema`):
-
-   ```sh
-   cd ~/dev/airship && umask 077 \
-     && read -rs "t?Pushover app token: " && echo \
-     && read -rs "u?Pushover user key: " && echo \
-     && printf 'PUSHOVER_TOKEN=%s\nPUSHOVER_USER=%s\n' "$t" "$u" >| .env.local \
-     && unset t u && varlock load
-   ```
+2. Put the token in the `airship` item and the user key in the shared
+   `pushover-user` item of the self-hosted Vaultwarden (fields
+   `PUSHOVER_TOKEN` and `PUSHOVER_USER`). `.env.schema` reads them with
+   `bwp()`. A machine needs the one-time vault setup from `~/dev/vw-tools`
+   (`./install.sh --client` on a non-Studio Mac, then
+   `vw-login <vault-account>` in a local terminal). `.env.local`
+   holds only non-secret values; a key set there overrides the vault, so do
+   not put the keys back there. To rotate: update the vault item, run
+   `vw-sync`, and restart.
 
 airship reads these values with `varlock run --path <airship dir>`, so the
 notification works whichever directory you call airship from. With no
