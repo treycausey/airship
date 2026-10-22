@@ -50,7 +50,9 @@ contract other projects rely on — do not break it silently.
   Treat this as the stable interface; anything else is an implementation
   detail of `airship.py`.
 - **Push notification needs no caller setup.** When airship's own
-  `.env.local` holds `PUSHOVER_TOKEN` / `PUSHOVER_USER`, it sends a Pushover
+  Varlock schema resolves `PUSHOVER_TOKEN` (vault item `airship`) and
+  `PUSHOVER_USER` (shared item `pushover-user`) from the self-hosted
+  Vaultwarden via `bwp()`, it sends a Pushover
   notification that links to the install page once the page is live. It
   reads those keys through `varlock run --path <airship dir>`, not from the
   caller's environment. A failed send prints a warning and never stops the
