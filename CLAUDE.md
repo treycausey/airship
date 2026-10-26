@@ -3,7 +3,7 @@
 airship is a standalone, single-file Python CLI (`airship.py`, run via
 `uv run`) that installs a finished iOS `.ipa` onto an iPhone over the air via
 Tailscale. It is not owned by one app — other projects depend on it as their
-device-install path. mise uses it today; flusso is adopting it.
+device-install path. sous (formerly mise) uses it today; flusso is adopting it.
 
 Read `README.md` for full usage and `docs/2026-06-24-airship-design.md` for
 the original design rationale before changing behavior. This file states the
