@@ -1,0 +1,1 @@
+{"checks": ["uv run --with pytest --with segno pytest tests/"]}
