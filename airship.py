@@ -17,8 +17,8 @@ either pid works; uv forwards SIGINT to the python process it runs.
 
 Avoid `pkill -TERM -f airship.py`. It matches uv's wrapper process as well as
 the python one, and uv responds by killing python before the cleanup finishes,
-which leaks the staging dir under $TMPDIR. A SIGTERM aimed at a single pid
-(either the uv pid or the python pid) is fine.
+which leaves the staging dir under $TMPDIR until the next run sweeps it. A
+SIGTERM aimed at a single pid (either the uv pid or the python pid) is fine.
 
 No cable, no shared WiFi. Both the Mac and the iPhone must be on the same
 Tailscale tailnet, with HTTPS certs enabled. The .ipa must be ad-hoc/development
@@ -901,8 +901,58 @@ def build_index_html(base_url: str, meta: dict[str, str]) -> str:
 """
 
 
+# Staging dirs are named airship-<pid>-<random> so a later run can tell whose
+# they are. `pkill -TERM -f airship.py` hits uv's wrapper too, and uv kills
+# python before `run()`'s cleanup finishes, leaking the dir (issue #3). Older
+# runs used airship-<random>, which names no owner; those are swept only when
+# no other airship is running at all, since one of them might be serving it.
+STAGING_RE = re.compile(r"airship-(\d+)-[A-Za-z0-9_]+")
+LEGACY_STAGING_RE = re.compile(r"airship-[A-Za-z0-9_]{8}")
+
+
+def _other_airship_running() -> bool:
+    """True when an airship process other than this run (or its uv wrapper) is alive."""
+    out = subprocess.run(
+        ["ps", "-Ao", "pid=,command="], capture_output=True, text=True, check=False
+    )
+    if out.returncode != 0:
+        return True  # cannot tell, so assume one is
+    own = {os.getpid(), os.getppid()}
+    for line in out.stdout.splitlines():
+        pid, _, cmd = line.strip().partition(" ")
+        if pid.isdigit() and int(pid) not in own and "airship.py" in cmd:
+            return True
+    return False
+
+
+def sweep_stale_staging(root: Path | None = None) -> None:
+    """Remove staging dirs left behind by airship runs that are no longer alive."""
+    root = root if root is not None else Path(tempfile.gettempdir())
+    try:
+        candidates = list(root.glob("airship-*"))
+    except OSError:
+        return
+    legacy_ok: bool | None = None  # computed lazily: only legacy dirs need ps
+    for path in candidates:
+        if path.is_symlink() or not path.is_dir():
+            continue
+        if m := STAGING_RE.fullmatch(path.name):
+            if _pid_command_matches(int(m.group(1)), "airship"):
+                continue  # a live airship (maybe another session's) owns it
+        elif LEGACY_STAGING_RE.fullmatch(path.name):
+            if not (path / MANIFEST_NAME).is_file():
+                continue  # not ours
+            if legacy_ok is None:
+                legacy_ok = not _other_airship_running()
+            if not legacy_ok:
+                continue  # an older-version airship may be serving it
+        else:
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def stage_artifacts(ipa_path: Path, base_url: str, meta: dict[str, str]) -> Path:
-    staging = Path(tempfile.mkdtemp(prefix="airship-"))
+    staging = Path(tempfile.mkdtemp(prefix=f"airship-{os.getpid()}-"))
     # APFS clone: instant like a hardlink, but an immutable snapshot — a
     # rebuild of the source .ipa cannot corrupt an in-flight download.
     clone = subprocess.run(
@@ -1074,6 +1124,7 @@ def run(ipa_path: Path, stay: bool = False, https_port: int | None = None) -> in
     server: http.server.ThreadingHTTPServer | None = None
     serve: ServeChild | None = None
     try:
+        sweep_stale_staging()
         staging = stage_artifacts(ipa_path, base_url, meta)
         state = ServerState(self_ips=tailscale_self_ips())
         server, port = start_server(staging, state)

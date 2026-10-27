@@ -163,6 +163,146 @@ def test_stage_artifacts_writes_url_safe_names():
         shutil.rmtree(staging, ignore_errors=True)
 
 
+def test_staging_dir_name_records_owner_pid(monkeypatch, tmp_path):
+    monkeypatch.setattr(airship.tempfile, "tempdir", str(tmp_path))
+    meta = airship.read_ipa_metadata(FIXTURE)
+    staging = airship.stage_artifacts(FIXTURE, BASE_URL, meta)
+    m = airship.STAGING_RE.fullmatch(staging.name)
+    assert m is not None and int(m.group(1)) == os.getpid()
+
+
+def _legacy_staging(root: Path, name: str) -> Path:
+    path = root / name
+    path.mkdir()
+    (path / airship.MANIFEST_NAME).write_text("x")
+    os.utime(path, (time.time() - 3 * 86400,) * 2)
+    return path
+
+
+def test_sweep_removes_staging_left_by_a_killed_airship(monkeypatch, tmp_path):
+    # Issue #3: `pkill -TERM -f airship.py` lets uv kill python before cleanup,
+    # leaking the staging dir. Reproduce with a real process killed outright
+    # mid-run (what uv does to it), then check the next run sweeps the dir.
+    import subprocess
+
+    monkeypatch.setattr(airship.tempfile, "tempdir", str(tmp_path))
+    script = (
+        "import sys, tempfile, time; sys.path.insert(0, sys.argv[1]); "
+        "import airship; from pathlib import Path; "
+        "tempfile.tempdir = sys.argv[2]; ipa = Path(sys.argv[3]); "
+        "s = airship.stage_artifacts(ipa, 'https://x.ts.net', "
+        "airship.read_ipa_metadata(ipa)); print(s, flush=True); time.sleep(60)"
+    )
+    # The child's argv mentions airship.py so the sweep sees it as an airship.
+    child = subprocess.Popen(
+        [sys.executable, "-c", script, str(Path(airship.__file__).parent),
+         str(tmp_path), str(FIXTURE), "airship.py"],
+        stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        leaked = Path(child.stdout.readline().strip())
+        assert leaked.is_dir()
+        airship.sweep_stale_staging()
+        assert leaked.is_dir()  # owner alive: never swept
+    finally:
+        child.kill()  # SIGKILL: no `finally:` cleanup, like uv's kill
+        child.wait()
+        child.stdout.close()
+    assert leaked.is_dir()  # the leak from the issue
+
+    airship.sweep_stale_staging()
+
+    assert not leaked.exists()
+
+
+def test_sweep_keeps_a_live_owners_dir_whatever_its_age(monkeypatch, tmp_path):
+    monkeypatch.setattr(airship.tempfile, "tempdir", str(tmp_path))
+    meta = airship.read_ipa_metadata(FIXTURE)
+    staging = airship.stage_artifacts(FIXTURE, BASE_URL, meta)
+    other = tmp_path / staging.name.replace(f"-{os.getpid()}-", "-4242-")
+    staging.rename(other)  # a --stay session from another shell
+    os.utime(other, (time.time() - 3 * 86400,) * 2)
+    alive = {4242: "uv run --script /x/airship.py --stay"}
+    monkeypatch.setattr(airship, "_pid_command", lambda pid: alive.get(pid))
+
+    airship.sweep_stale_staging()
+
+    assert other.exists()
+
+
+def test_sweep_removes_a_dead_owners_dir(monkeypatch, tmp_path):
+    monkeypatch.setattr(airship.tempfile, "tempdir", str(tmp_path))
+    meta = airship.read_ipa_metadata(FIXTURE)
+    staging = airship.stage_artifacts(FIXTURE, BASE_URL, meta)
+    dead = tmp_path / staging.name.replace(f"-{os.getpid()}-", "-4242-")
+    staging.rename(dead)
+    instance = tmp_path / "airship-instance-443.json"
+    instance.write_text("{}")
+    monkeypatch.setattr(airship, "_pid_command", lambda pid: None)
+
+    airship.sweep_stale_staging()
+
+    assert not dead.exists()
+    assert instance.exists()  # the next run on that port consumes it
+
+
+def test_sweep_keeps_legacy_dirs_while_any_airship_runs(monkeypatch, tmp_path):
+    # airship-<random> dirs from older versions name no owner. A --stay session
+    # of that version may have been serving one for days, so age proves nothing.
+    legacy = _legacy_staging(tmp_path, "airship-ku4ssd8_")
+    monkeypatch.setattr(airship, "_other_airship_running", lambda: True)
+
+    airship.sweep_stale_staging(tmp_path)
+
+    assert legacy.exists()
+
+
+def test_sweep_removes_legacy_dirs_when_no_airship_runs(monkeypatch, tmp_path):
+    legacy = _legacy_staging(tmp_path, "airship-ku4ssd8_")
+    unrelated = tmp_path / "airship-notours1"
+    unrelated.mkdir()  # no manifest: not an airship staging dir
+    monkeypatch.setattr(airship, "_other_airship_running", lambda: False)
+
+    airship.sweep_stale_staging(tmp_path)
+
+    assert not legacy.exists()
+    assert unrelated.exists()
+
+
+def test_other_airship_running_ignores_this_run_and_its_uv_wrapper(monkeypatch):
+    class Out:
+        returncode = 0
+        stdout = (
+            f"  {os.getpid()} python /x/airship.py\n"
+            f"  {os.getppid()} uv run --script /x/airship.py\n"
+            "  77 /bin/zsh\n"
+        )
+
+    monkeypatch.setattr(airship.subprocess, "run", lambda *a, **k: Out)
+    assert airship._other_airship_running() is False
+    Out.stdout += "  78 python /y/airship.py --stay\n"
+    assert airship._other_airship_running() is True
+
+
+def test_run_sweeps_stale_staging_before_staging(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(airship.signal, "signal", lambda sig, handler: None)
+    monkeypatch.setattr(airship, "INSTANCE_DIR", tmp_path)
+    monkeypatch.setattr(airship, "read_ipa_metadata", lambda p: {"embedded_profile": None})
+    monkeypatch.setattr(airship, "warn_on_signing", lambda *a: None)
+    monkeypatch.setattr(airship, "claim_https_port", lambda p: 443)
+    monkeypatch.setattr(airship, "tailscale_base_url", lambda p: BASE_URL)
+    monkeypatch.setattr(airship, "sweep_stale_staging", lambda: calls.append("sweep"))
+
+    def stop(*a):
+        calls.append("stage")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(airship, "stage_artifacts", stop)
+    airship.run(FIXTURE)
+    assert calls == ["sweep", "stage"]
+
+
 def test_handler_sets_correct_content_types(tmp_path):
     handler_cls = airship.make_handler(tmp_path, airship.ServerState())
     # guess_type is a method; check the suffix mapping it relies on
