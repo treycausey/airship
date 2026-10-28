@@ -190,7 +190,7 @@ In `index.html` the href is written as
 
 ## Project setup
 
-- Repo: `~/dev/airship`, local git + private `treycausey/airship` remote via `gh`.
+- Repo: `~/dev/airship`, local git + `treycausey/airship` GitHub remote.
 - Port block 4190 added to the global dev-server port table.
 - `README.md`: prerequisites and the one-command usage, verified by running it
   against a real `.ipa` before commit. Prereqs to call out explicitly:

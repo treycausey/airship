@@ -18,8 +18,7 @@ import socket
 from urllib.parse import quote
 
 import pytest
-
-from conftest import BUNDLE_ID, BUNDLE_VERSION, APP_TITLE
+from conftest import APP_TITLE, BUNDLE_ID, BUNDLE_VERSION
 
 pytestmark = pytest.mark.e2e
 
@@ -139,11 +138,11 @@ def test_instance_record_is_written_keyed_by_port_and_cleaned_up_on_shutdown(
 def test_pushover_never_reaches_the_real_network_even_with_a_real_looking_env_local(
     airship_factory, fixture_ipa, airship_copy_with_dummy_env
 ):
-    """The main checkout (~/dev/airship) has a REAL
-    .env.local with real Pushover credentials. notify_ready() resolves its
+    """A developer's main checkout may have a REAL .env.local with real
+    Pushover credentials. notify_ready() resolves its
     env dir from the running script's own directory, so if this suite ever
     ran airship.py from a copy sitting next to a `.env.local` — real or
-    dummy — a real push would fire straight to Trey's phone unless something
+    dummy — a real push would fire straight to a real phone unless something
     intercepts it upstream of any credential ever being read. This proves
     fake_varlock.py is that interception point, using a DUMMY .env.local
     (never the real one) to trigger the same code path.

@@ -86,15 +86,14 @@ the QR code. Set it up once:
 
 1. On pushover.net, create an application for airship and copy its API token.
    Copy your user key from the dashboard too.
-2. Put the token in the `airship` item and the user key in the shared
-   `pushover-user` item of the self-hosted Vaultwarden (fields
-   `PUSHOVER_TOKEN` and `PUSHOVER_USER`). `.env.schema` reads them with
-   `bwp()`. A machine needs the one-time vault setup from `~/dev/vw-tools`
-   (`./install.sh --client` on a non-Studio Mac, then
-   `vw-login <vault-account>` in a local terminal). `.env.local`
-   holds only non-secret values; a key set there overrides the vault, so do
-   not put the keys back there. To rotate: update the vault item, run
-   `vw-sync`, and restart.
+2. Make `PUSHOVER_TOKEN` and `PUSHOVER_USER` resolvable by
+   [Varlock](https://varlock.dev) in the airship directory. The shipped
+   `.env.schema` reads them from a self-hosted Vaultwarden with `bwp()`
+   (token in the `airship` item, user key in the `pushover-user` item); edit
+   it to point at your own secret store. A key set in `.env.local` overrides
+   the schema, so `.env.local` is the simplest place for a setup without a
+   vault. Optional `PUSHOVER_BASE_URL` sends to a self-hosted
+   Pushover-compatible server instead of `api.pushover.net`.
 
 airship reads these values with `varlock run --path <airship dir>`, so the
 notification works whichever directory you call airship from. With no
@@ -129,7 +128,7 @@ If it still shows the wrong app, cheapest first:
   a worker registered on 443 cannot intercept it. This is also the answer when
   something legitimately owns `/` on 443 and you would rather not disturb it.
 - Fix the offending app to only register its worker on an origin it owns
-  (flusso does this: `src/lib/sw-origin-guard.ts`).
+  (check `location.hostname` before calling `navigator.serviceWorker.register`).
 
 airship never overwrites another service's Serve mapping: it refuses with
 instructions instead. A mapping on any port *other* than the one it is using is

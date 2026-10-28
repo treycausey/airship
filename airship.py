@@ -122,7 +122,7 @@ CONTENT_TYPES = {
 # Served for ANY `*.js` request. The install page ships no JavaScript of its
 # own, so every script request that reaches airship is a browser updating a
 # service worker that some PWA registered on this origin earlier (443 is
-# shared: flusso did exactly this on 2026-07-24 and its cached shell replaced
+# shared: one app did exactly this on 2026-07-24 and its cached shell replaced
 # the install page). A worker's update check fetches its own script URL and
 # installs whatever comes back if the bytes differ, so the reply is a worker
 # whose only job is to clear the caches, unregister, and reload the page onto
@@ -773,7 +773,8 @@ def probe_landing(url: str) -> None:
 # that `ps` would show.
 PUSHOVER_URL = "https://api.pushover.net/1/messages.json"
 _PUSHOVER_SH = (
-    # squillo (~/dev/squillo) serves the same API; PUSHOVER_BASE_URL points there.
+    # A self-hosted Pushover-compatible server can serve the same API;
+    # PUSHOVER_BASE_URL points there.
     'u="$5"; [ -n "${PUSHOVER_BASE_URL:-}" ] && u="${PUSHOVER_BASE_URL%/}/1/messages.json"; '
     'printf "token=%s&user=%s" "$PUSHOVER_TOKEN" "$PUSHOVER_USER" | '
     'curl -sS --max-time 15 --data-binary @- '
